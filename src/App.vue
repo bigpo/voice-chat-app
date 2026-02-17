@@ -18,10 +18,10 @@
       <!-- Debug Info -->
       <div class="debug-info" v-if="showDebug">
         <div>VAD: {{ vadActive ? 'ON' : 'OFF' }}</div>
-        <div>Recording: {{ isRecording ? 'YES' : 'NO' }}</div>
+        <div>Listening: {{ isListening ? 'YES' : 'NO' }}</div>
         <div>Processing: {{ isProcessing ? 'YES' : 'NO' }}</div>
-        <div>Volume: {{ lastVolume }}</div>
-        <div v-if="asrText">ASR: {{ asrText }}</div>
+        <div v-if="transcript">ASR: {{ transcript }}</div>
+        <div v-if="aiResponse">AI: {{ aiResponse }}</div>
       </div>
     </div>
   </div>
@@ -35,29 +35,21 @@ export default {
       ws: null,
       isConnected: false,
       inCallMode: false,
-      isRecording: false,
+      isListening: false,
       isProcessing: false,
-      callStatus: 'idle', // idle, connecting, ready, listening, processing, speaking
+      callStatus: 'idle',
       
       // Audio
       stream: null,
       audioContext: null,
-      analyser: null,
       mediaRecorder: null,
       audioChunks: [],
-      vadInterval: null,
       
-      // Config
-      userId: 'user_' + Math.random().toString(36).substr(2, 9),
+      // Config - OpenClaw Voice protocol
       serverUrl: 'ws://154.89.149.198:8765/ws',
-      token: 'voice_9527_secret_key_2026',
-      vadThreshold: 0.005,  // Lower threshold
-      vadSilenceThreshold: 1500,
-      lastSpeechTime: 0,
-      vadActive: false,
-      lastVolume: 0,
       showDebug: true,
-      asrText: ''
+      transcript: '',
+      aiResponse: ''
     }
   },
   mounted() {
@@ -81,13 +73,13 @@ export default {
         this.ws.onopen = () => {
           console.log('WS Connected')
           this.isConnected = true
-          this.send({ action: 'auth', payload: { userId: this.userId, token: this.token }})
+          this.callStatus = 'ready'
         }
 
         this.ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data)
-            console.log('WS Received:', data.action)
+            console.log('WS Received:', data.type)
             this.handleMessage(data)
           } catch (e) {
             console.error('Parse error:', e)
@@ -97,6 +89,7 @@ export default {
         this.ws.onclose = () => {
           console.log('WS Disconnected')
           this.isConnected = false
+          this.callStatus = 'disconnected'
           if (this.inCallMode) {
             setTimeout(() => this.connectWebSocket(), 3000)
           }
@@ -126,39 +119,45 @@ export default {
     },
 
     handleMessage(data) {
-      console.log('[WS] Received:', data.action)
-      const { action, payload } = data
+      const { type, text, final } = data
 
-      switch (action) {
-        case 'auth_ok':
-          console.log('Auth OK, starting VAD')
-          if (this.inCallMode) {
-            this.callStatus = 'ready'
-            this.startVAD()  // Start VAD after auth
-          }
+      switch (type) {
+        case 'listening_started':
+          console.log('Started listening')
+          this.isListening = true
           break
-
-        case 'typing':
-          this.callStatus = 'processing'
-          break
-
-        case 'asr_result':
-          // User speech recognized - show on screen
-          this.asrText = payload?.text || '(无识别结果)'
-          break
-
-        case 'reply':
-          this.isProcessing = false
-          this.callStatus = 'speaking'
           
-          // Auto-play audio
-          if (payload.audioUrl) {
-            this.playAudio(payload.audioUrl)
-          } else {
-            // No audio, restart VAD immediately
-            this.callStatus = 'ready'
-            this.startVAD()
+        case 'listening_stopped':
+          console.log('Stopped listening')
+          this.isListening = false
+          break
+          
+        case 'transcript':
+          if (final) {
+            this.transcript = text
+            console.log('Final transcript:', text)
           }
+          break
+          
+        case 'response_chunk':
+          this.aiResponse = (this.aiResponse || '') + text
+          break
+          
+        case 'audio_chunk':
+          // Play audio chunk
+          this.playAudioChunk(data.data)
+          break
+          
+        case 'response_complete':
+          console.log('Response complete:', text)
+          this.isProcessing = false
+          this.callStatus = 'ready'
+          // Restart listening
+          this.startListening()
+          break
+          
+        case 'vad_status':
+          console.log('VAD:', data.speech_detected)
           break
       }
     },
@@ -173,7 +172,6 @@ export default {
     },
 
     async enterCallMode() {
-      // Check if browser supports getUserMedia
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert('抱歉，您的浏览器不支持语音功能。\n\n请使用 APP 版本')
         return
@@ -183,13 +181,11 @@ export default {
         this.inCallMode = true
         this.callStatus = 'connecting'
         
-        // Ensure WebSocket connected
+        // Connect WebSocket
         if (!this.isConnected) {
           this.connectWebSocket()
+          await new Promise(resolve => setTimeout(resolve, 2000))
         }
-        
-        // Wait for connection
-        await new Promise(resolve => setTimeout(resolve, 1000))
         
         // Request microphone
         this.stream = await navigator.mediaDevices.getUserMedia({ 
@@ -200,30 +196,16 @@ export default {
           } 
         })
         
-        // Setup audio analysis for VAD
+        // Setup audio context
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)()
-        
-        // Resume audio context (required for Android)
         if (this.audioContext.state === 'suspended') {
           await this.audioContext.resume()
         }
         
-        const source = this.audioContext.createMediaStreamSource(this.stream)
-        this.analyser = this.audioContext.createAnalyser()
-        this.analyser.fftSize = 256
-        source.connect(this.analyser)
-        
-        // Test if analyser is working
-        const testData = new Uint8Array(this.analyser.frequencyBinCount)
-        this.analyser.getByteFrequencyData(testData)
-        const testVolume = testData.reduce((a, b) => a + b) / testData.length
-        console.log('[Mic Test] Initial volume:', testVolume)
-        
         this.callStatus = 'ready'
         
-        // Start VAD immediately for debugging
-        console.log('[Call] Starting VAD now')
-        this.startVAD()
+        // Start listening
+        this.startListening()
         
       } catch (e) {
         console.error('Failed to enter call mode:', e)
@@ -235,9 +217,7 @@ export default {
 
     leaveCallMode() {
       this.inCallMode = false
-      this.stopVAD()
-      this.isRecording = false
-      this.isProcessing = false
+      this.stopListening()
       
       if (this.stream) {
         this.stream.getTracks().forEach(track => track.stop())
@@ -252,216 +232,125 @@ export default {
       this.callStatus = 'idle'
     },
 
-    // ===== VAD =====
-    startVAD() {
-      if (!this.analyser) {
-        console.error('[VAD] Analyser not initialized!')
-        return
-      }
-      if (this.vadInterval) return
-      this.vadActive = true
-      console.log('[VAD] Starting...')
+    // ===== Audio Recording =====
+    startListening() {
+      if (!this.stream || !this.audioContext) return
       
-      const dataArray = new Uint8Array(this.analyser.frequencyBinCount)
+      this.isListening = true
+      this.transcript = ''
+      this.aiResponse = ''
       
-      this.vadInterval = setInterval(() => {
-        if (this.isRecording || this.isProcessing) return
-        
-        this.analyser.getByteFrequencyData(dataArray)
-        const average = dataArray.reduce((a, b) => a + b) / dataArray.length
-        const volume = average / 255
-        this.lastVolume = Math.round(volume * 100)
-        
-        const now = Date.now()
-        
-        if (volume > this.vadThreshold) {
-          this.lastSpeechTime = now
-          if (!this.isRecording) {
-            console.log('VAD: Speech detected, starting recording')
-            this.startRecording()
-          }
-        } else {
-          if (this.isRecording && (now - this.lastSpeechTime) > this.vadSilenceThreshold) {
-            console.log('VAD: Silence detected, stopping recording')
-            this.stopRecording()
-          }
+      // Send start_listening
+      this.send({ type: 'start_listening' })
+      
+      // Create audio recorder
+      this.mediaRecorder = new MediaRecorder(this.stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      })
+      
+      this.audioChunks = []
+      
+      this.mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          this.audioChunks.push(e.data)
         }
-      }, 100)
+      }
+      
+      this.mediaRecorder.onstop = () => {
+        this.processAudio()
+      }
+      
+      // Start recording with timeslice
+      this.mediaRecorder.start(100)
     },
 
-    stopVAD() {
-      if (this.vadInterval) {
-        clearInterval(this.vadInterval)
-        this.vadInterval = null
-      }
-    },
-
-    // ===== Recording =====
-    startRecording() {
-      if (this.isRecording) return
-      
-      // Clear previous ASR result
-      this.asrText = ''
-      
-      try {
-        this.mediaRecorder = new MediaRecorder(this.stream, {
-          mimeType: 'audio/webm;codecs=opus'
-        })
-        this.audioChunks = []
-
-        this.mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) this.audioChunks.push(e.data)
-        }
-
-        this.mediaRecorder.onstop = () => {
-          console.log('[Recording] Stopped, chunks:', this.audioChunks.length)
-          this.sendAudio()
-        }
-
-        this.mediaRecorder.start(100) // Collect data every 100ms
-        
-        this.isRecording = true
-        this.callStatus = 'listening'
-        
-      } catch (e) {
-        console.error('Recording error:', e)
-      }
-    },
-
-    stopRecording() {
-      if (!this.isRecording) return
-      
+    stopListening() {
       if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
         this.mediaRecorder.stop()
       }
-      this.isRecording = false
+      this.isListening = false
+      
+      // Send stop_listening
+      this.send({ type: 'stop_listening' })
     },
 
-    async sendAudio() {
+    async processAudio() {
       if (this.audioChunks.length === 0) return
-
-      // Stop VAD - AI is processing
-      this.stopVAD()
       
       this.isProcessing = true
       this.callStatus = 'processing'
+      this.stopListening()
       
-      const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
-      console.log('[Audio] Blob size:', audioBlob.size)
-      
-      // Convert to wav using AudioContext - downsample to 16kHz
-      const arrayBuffer = await audioBlob.arrayBuffer()
-      const audioCtx = new AudioContext()
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
-      
-      // Downsample to 16kHz (required by ASR)
-      const offlineCtx = new OfflineAudioContext(1, audioBuffer.length * 16000 / audioBuffer.sampleRate, 16000)
-      const channelData = audioBuffer.getChannelData(0)
-      const downsampledBuffer = offlineCtx.createBuffer(1, channelData.length * 16000 / audioBuffer.sampleRate, 16000)
-      const downsampledData = downsampledBuffer.getChannelData(0)
-      
-      for (let i = 0; i < downsampledData.length; i++) {
-        downsampledData[i] = channelData[Math.floor(i * audioBuffer.sampleRate / 16000)]
-      }
-      
-      // Convert to WAV
-      const wavBlob = this.audioBufferToWav(downsampledBuffer)
-      console.log('[Audio] WAV size:', wavBlob.size)
-      
-      const reader = new FileReader()
-      
-      reader.onload = () => {
-        const base64 = reader.result.split(',')[1]
-        console.log('[Audio] Base64 length:', base64.length)
+      try {
+        // Convert to PCM float32
+        const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
+        const arrayBuffer = await audioBlob.arrayBuffer()
+        const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer)
         
+        // Get PCM data
+        const channelData = audioBuffer.getChannelData(0)
+        
+        // Convert to base64
+        const pcmData = this.floatToBase64(channelData)
+        
+        // Send audio
         this.send({
-          action: 'audio',
-          payload: { userId: this.userId, data: base64, format: 'wav' }
+          type: 'audio',
+          data: pcmData
         })
         
-        this.audioChunks = []
-        audioCtx.close()
+      } catch (e) {
+        console.error('Audio processing error:', e)
+        this.isProcessing = false
+        this.callStatus = 'ready'
+        this.startListening()
       }
       
-      reader.readAsDataURL(wavBlob)
+      this.audioChunks = []
     },
-    
-    audioBufferToWav(buffer) {
-      const numChannels = buffer.numberOfChannels
-      const sampleRate = buffer.sampleRate
-      const format = 1 // PCM
-      const bitDepth = 16
-      
-      const result = this.interleave(buffer)
-      const dataLength = result.length * 2
-      const headerLength = 44
-      const totalLength = headerLength + dataLength
-      
-      const header = new ArrayBuffer(headerLength)
-      const view = new DataView(header)
-      
-      const writeString = (view, offset, string) => {
-        for (let i = 0; i < string.length; i++) {
-          view.setUint8(offset + i, string.charCodeAt(i))
-        }
+
+    floatToBase64(float32Array) {
+      // Convert float32 to 16-bit PCM
+      const int16Array = new Int16Array(float32Array.length)
+      for (let i = 0; i < float32Array.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32Array[i]))
+        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
       }
       
-      writeString(view, 0, 'RIFF')
-      view.setUint32(4, 36 + dataLength, true)
-      writeString(view, 8, 'WAVE')
-      writeString(view, 12, 'fmt ')
-      view.setUint32(16, 16, true)
-      view.setUint16(20, format, true)
-      view.setUint16(22, numChannels, true)
-      view.setUint32(24, sampleRate, true)
-      view.setUint32(28, sampleRate * numChannels * 2, true)
-      view.setUint16(32, numChannels * 2, true)
-      view.setUint16(34, bitDepth, true)
-      writeString(view, 36, 'data')
-      view.setUint32(40, dataLength, true)
-      
-      const wavData = new Int16Array(result)
-      const wavBlob = new Blob([header, wavData], { type: 'audio/wav' })
-      return wavBlob
-    },
-    
-    interleave(buffer) {
-      const numChannels = buffer.numberOfChannels
-      const length = buffer.length
-      const result = new Float32Array(length * numChannels)
-      
-      const channels = []
-      for (let i = 0; i < numChannels; i++) {
-        channels.push(buffer.getChannelData(i))
+      // Convert to base64
+      let binary = ''
+      const bytes = new Uint8Array(int16Array.buffer)
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i])
       }
-      
-      let index = 0
-      for (let i = 0; i < length; i++) {
-        for (let j = 0; j < numChannels; j++) {
-          result[index++] = channels[j][i]
-        }
-      }
-      
-      return result
+      return btoa(binary)
     },
 
     // ===== Audio Playback =====
-    playAudio(url) {
-      const audio = new Audio(url)
-      
-      audio.onended = () => {
-        console.log('Playback ended, restarting VAD')
-        this.callStatus = 'ready'
-        this.startVAD()  // Restart VAD after TTS done
-      }
-      
-      audio.onerror = (e) => {
+    playAudioChunk(base64Data) {
+      try {
+        const binary = atob(base64Data)
+        const bytes = new Uint8Array(binary.length)
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i)
+        }
+        
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
+        const audioBuffer = audioCtx.createBuffer(1, bytes.length / 2, 16000)
+        const channelData = audioBuffer.getChannelData(0)
+        
+        const int16Array = new Int16Array(bytes.buffer)
+        for (let i = 0; i < int16Array.length; i++) {
+          channelData[i] = int16Array[i] / 32768.0
+        }
+        
+        const source = audioCtx.createBufferSource()
+        source.buffer = audioBuffer
+        source.connect(audioCtx.destination)
+        source.start()
+      } catch (e) {
         console.error('Playback error:', e)
-        this.callStatus = 'ready'
-        this.startVAD()  // Restart VAD even on error
       }
-      
-      audio.play().catch(e => console.error('Play failed:', e))
     },
 
     // ===== UI =====
@@ -472,7 +361,7 @@ export default {
         case 'ready': return '请说话'
         case 'listening': return '正在听...'
         case 'processing': return 'AI 处理中...'
-        case 'speaking': return 'AI 说话中...'
+        case 'disconnected': return '断开连接'
         case 'error': return '连接错误'
         default: return ''
       }
