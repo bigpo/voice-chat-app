@@ -298,7 +298,12 @@ export default {
       if (this.isRecording) return
       
       try {
-        this.mediaRecorder = new MediaRecorder(this.stream)
+        // Limit recording to 10 seconds max
+        const maxDuration = 10000
+        
+        this.mediaRecorder = new MediaRecorder(this.stream, {
+          mimeType: 'audio/webm;codecs=opus'
+        })
         this.audioChunks = []
 
         this.mediaRecorder.ondataavailable = (e) => {
@@ -306,12 +311,23 @@ export default {
         }
 
         this.mediaRecorder.onstop = () => {
+          console.log('[Recording] Stopped, chunks:', this.audioChunks.length)
           this.sendAudio()
         }
 
-        this.mediaRecorder.start()
+        this.mediaRecorder.start(100) // Collect data every 100ms
+        
         this.isRecording = true
         this.callStatus = 'listening'
+        
+        // Auto-stop after max duration
+        setTimeout(() => {
+          if (this.isRecording) {
+            console.log('[Recording] Max duration reached')
+            this.stopRecording()
+          }
+        }, maxDuration)
+        
       } catch (e) {
         console.error('Recording error:', e)
       }
@@ -336,18 +352,32 @@ export default {
       this.callStatus = 'processing'
       
       const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
+      console.log('[Audio] Blob size:', audioBlob.size)
       
-      // Convert to wav using AudioContext
+      // Convert to wav using AudioContext - downsample to 16kHz
       const arrayBuffer = await audioBlob.arrayBuffer()
       const audioCtx = new AudioContext()
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
       
+      // Downsample to 16kHz (required by ASR)
+      const offlineCtx = new OfflineAudioContext(1, audioBuffer.length * 16000 / audioBuffer.sampleRate, 16000)
+      const channelData = audioBuffer.getChannelData(0)
+      const downsampledBuffer = offlineCtx.createBuffer(1, channelData.length * 16000 / audioBuffer.sampleRate, 16000)
+      const downsampledData = downsampledBuffer.getChannelData(0)
+      
+      for (let i = 0; i < downsampledData.length; i++) {
+        downsampledData[i] = channelData[Math.floor(i * audioBuffer.sampleRate / 16000)]
+      }
+      
       // Convert to WAV
-      const wavBlob = this.audioBufferToWav(audioBuffer)
+      const wavBlob = this.audioBufferToWav(downsampledBuffer)
+      console.log('[Audio] WAV size:', wavBlob.size)
+      
       const reader = new FileReader()
       
       reader.onload = () => {
         const base64 = reader.result.split(',')[1]
+        console.log('[Audio] Base64 length:', base64.length)
         
         this.send({
           action: 'audio',
