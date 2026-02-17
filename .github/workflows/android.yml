@@ -46,12 +46,3 @@ jobs:
         with:
           name: voice-chat-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Upload APK as Release
-        uses: softprops/action-gh-release@v1
-        if: github.event_name == 'workflow_dispatch'
-        with:
-          files: android/app/build/outputs/apk/debug/app-debug.apk
-          tag_name: v1.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

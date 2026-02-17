@@ -11,8 +11,8 @@
     <!-- Chat Area -->
     <div class="chat-area" ref="chatArea">
       <div v-if="messages.length === 0" class="empty-tip">
-        <p>👋 长按麦克风说话</p>
-        <p class="sub">松开发送语音</p>
+        <p>{{ inCallMode ? '🎙️ 通话中...' : '👋 长按麦克风说话' }}</p>
+        <p class="sub" v-if="!inCallMode">松开发送语音</p>
       </div>
       
       <div
@@ -23,12 +23,6 @@
       >
         <div class="bubble">
           <p>{{ msg.text }}</p>
-          <audio
-            v-if="msg.audioUrl"
-            :src="msg.audioUrl"
-            controls
-            @play="onAudioPlay(msg)"
-          ></audio>
         </div>
       </div>
 
@@ -40,35 +34,48 @@
       </div>
     </div>
 
-    <!-- Recording Indicator -->
-    <div v-if="isRecording" class="recording-indicator">
-      <div class="recording-dot"></div>
-      <span>{{ formatDuration(recordingDuration) }}</span>
+    <!-- Call Mode Indicator -->
+    <div v-if="inCallMode" class="call-indicator">
+      <div class="call-pulse"></div>
+      <span>通话中</span>
+      <span class="call-status">{{ callStatus }}</span>
     </div>
 
     <!-- Input Area -->
     <div class="input-area">
-      <input
-        v-model="textInput"
-        type="text"
-        placeholder="输入文字消息..."
-        @keyup.enter="sendText"
-      />
-      <button class="send-btn" @click="sendText" :disabled="!textInput.trim()">
-        发送
+      <!-- Call Button -->
+      <button 
+        class="call-btn" 
+        :class="{ active: inCallMode }"
+        @click="toggleCallMode"
+      >
+        <span class="phone-icon">📞</span>
       </button>
-      
+
+      <!-- Text Input (only when not in call mode) -->
+      <template v-if="!inCallMode">
+        <input
+          v-model="textInput"
+          type="text"
+          placeholder="输入文字..."
+          @keyup.enter="sendText"
+        />
+        <button class="send-btn" @click="sendText" :disabled="!textInput.trim()">
+          发送
+        </button>
+      </template>
+
       <!-- Voice Button -->
       <button
         class="voice-btn"
-        :class="{ recording: isRecording }"
+        :class="{ recording: isRecording, listening: inCallMode && !isProcessing }"
         @mousedown="startRecording"
         @mouseup="stopRecording"
         @touchstart.prevent="startRecording"
         @touchend.prevent="stopRecording"
       >
-        <span class="mic-icon">🎤</span>
-        <span class="hold-tip">{{ isRecording ? '松开发送' : '按住说话' }}</span>
+        <span class="mic-icon">{{ inCallMode ? '🎤' : '🎙️' }}</span>
+        <span class="hold-tip">{{ getVoiceButtonText() }}</span>
       </button>
     </div>
   </div>
@@ -83,29 +90,38 @@ export default {
       isConnected: false,
       isTyping: false,
       isRecording: false,
+      isProcessing: false,
       recordingDuration: 0,
       recordingTimer: null,
       mediaRecorder: null,
       audioChunks: [],
+      analyser: null,
+      audioContext: null,
       textInput: '',
       messages: [],
       userId: 'user_' + Math.random().toString(36).substr(2, 9),
       serverUrl: 'ws://154.89.149.198:8765/ws',
-      token: 'voice_9527_secret_key_2026'
+      token: 'voice_9527_secret_key_2026',
+      
+      // Call mode
+      inCallMode: false,
+      callStatus: '等待...',
+      vadThreshold: 0.01,
+      vadSilenceThreshold: 1500, // ms of silence to detect end of speech
+      lastSpeechTime: 0,
+      vadInterval: null,
+      stream: null
     }
   },
   mounted() {
     this.connectWebSocket()
-    
-    // Request permissions
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      console.log('Audio recording available')
-    }
   },
   beforeUnmount() {
+    this.leaveCallMode()
     this.disconnectWebSocket()
   },
   methods: {
+    // ===== WebSocket =====
     connectWebSocket() {
       console.log('Connecting to', this.serverUrl)
       this.ws = new WebSocket(this.serverUrl)
@@ -113,14 +129,9 @@ export default {
       this.ws.onopen = () => {
         console.log('WS Connected')
         this.isConnected = true
-        
-        // Authenticate
         this.send({
           action: 'auth',
-          payload: {
-            userId: this.userId,
-            token: this.token
-          }
+          payload: { userId: this.userId, token: this.token }
         })
       }
 
@@ -137,7 +148,6 @@ export default {
       this.ws.onclose = () => {
         console.log('WS Disconnected')
         this.isConnected = false
-        // Reconnect after 3 seconds
         setTimeout(() => this.connectWebSocket(), 3000)
       }
 
@@ -173,15 +183,12 @@ export default {
 
         case 'typing':
           this.isTyping = true
+          this.callStatus = 'AI 处理中...'
           break
 
         case 'asr_result':
-          // Show ASR result
-          this.messages.push({
-            role: 'user',
-            text: payload.text,
-            audioUrl: null
-          })
+          // Show user speech
+          this.messages.push({ role: 'user', text: payload.text })
           this.scrollToBottom()
           break
 
@@ -190,29 +197,131 @@ export default {
           this.messages.push({
             role: 'ai',
             text: payload.text,
-            audioUrl: payload.audioUrl || null
+            audioUrl: payload.audioUrl
           })
           this.scrollToBottom()
           
-          // Auto-play audio if available
+          // Auto-play audio
           if (payload.audioUrl) {
-            // Audio will play when user clicks play button
+            this.callStatus = '播放语音...'
+            this.playAudio(payload.audioUrl)
+          } else {
+            this.callStatus = '等待...'
           }
           break
 
         case 'error':
           this.isTyping = false
-          alert('Error: ' + payload.message)
+          this.callStatus = '出错: ' + payload.message
+          setTimeout(() => {
+            if (this.inCallMode) this.callStatus = '等待...'
+          }, 3000)
           break
       }
     },
 
+    // ===== Call Mode =====
+    toggleCallMode() {
+      if (this.inCallMode) {
+        this.leaveCallMode()
+      } else {
+        this.enterCallMode()
+      }
+    },
+
+    async enterCallMode() {
+      try {
+        // Request microphone permission
+        this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        
+        // Setup audio context for VAD
+        this.audioContext = new (window.AudioContext || window.webkitAudioContext)()
+        const source = this.audioContext.createMediaStreamSource(this.stream)
+        this.analyser = this.audioContext.createAnalyser()
+        this.analyser.fftSize = 256
+        source.connect(this.analyser)
+        
+        this.inCallMode = true
+        this.callStatus = '等待说话...'
+        this.messages = []
+        
+        // Start VAD detection
+        this.startVAD()
+        
+      } catch (e) {
+        console.error('Failed to enter call mode:', e)
+        alert('无法访问麦克风，请检查权限')
+      }
+    },
+
+    leaveCallMode() {
+      this.inCallMode = false
+      this.stopVAD()
+      
+      if (this.stream) {
+        this.stream.getTracks().forEach(track => track.stop())
+        this.stream = null
+      }
+      
+      if (this.audioContext) {
+        this.audioContext.close()
+        this.audioContext = null
+      }
+      
+      this.callStatus = ''
+    },
+
+    // ===== VAD (Voice Activity Detection) =====
+    startVAD() {
+      const dataArray = new Uint8Array(this.analyser.frequencyBinCount)
+      
+      this.vadInterval = setInterval(() => {
+        if (this.isRecording || this.isProcessing) return
+        
+        this.analyser.getByteFrequencyData(dataArray)
+        
+        // Calculate average volume
+        const average = dataArray.reduce((a, b) => a + b) / dataArray.length
+        const volume = average / 255
+        
+        const now = Date.now()
+        
+        if (volume > this.vadThreshold) {
+          // Voice detected
+          this.lastSpeechTime = now
+          this.callStatus = '正在说话...'
+          
+          // Auto-start recording if not already
+          if (!this.isRecording) {
+            this.startRecording()
+          }
+        } else {
+          // Silence
+          if (this.isRecording && (now - this.lastSpeechTime) > this.vadSilenceThreshold) {
+            // End of speech detected
+            this.stopRecording()
+          }
+        }
+      }, 100)
+    },
+
+    stopVAD() {
+      if (this.vadInterval) {
+        clearInterval(this.vadInterval)
+        this.vadInterval = null
+      }
+    },
+
+    // ===== Recording =====
     async startRecording() {
-      if (this.isRecording) return
+      if (this.isRecording || this.isProcessing) return
       
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-        this.mediaRecorder = new MediaRecorder(stream)
+        if (!this.stream) {
+          this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        }
+        
+        this.mediaRecorder = new MediaRecorder(this.stream)
         this.audioChunks = []
 
         this.mediaRecorder.ondataavailable = (e) => {
@@ -223,8 +332,6 @@ export default {
 
         this.mediaRecorder.onstop = () => {
           this.sendAudio()
-          // Stop all tracks
-          stream.getTracks().forEach(track => track.stop())
         }
 
         this.mediaRecorder.start()
@@ -237,7 +344,6 @@ export default {
 
       } catch (e) {
         console.error('Recording error:', e)
-        alert('无法访问麦克风，请检查权限')
       }
     },
 
@@ -256,6 +362,9 @@ export default {
     async sendAudio() {
       if (this.audioChunks.length === 0) return
 
+      this.isProcessing = true
+      this.callStatus = '识别中...'
+      
       // Convert to base64
       const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
       const reader = new FileReader()
@@ -272,44 +381,60 @@ export default {
           }
         })
         
-        // Show pending message
-        this.messages.push({
-          role: 'user',
-          text: '🎤 语音发送中...',
-          audioUrl: null
-        })
+        // Show pending
+        this.messages.push({ role: 'user', text: '🎤 正在识别...' })
         this.scrollToBottom()
+        
+        // Reset for next recording
+        this.audioChunks = []
+        this.isProcessing = false
       }
       
       reader.readAsDataURL(audioBlob)
     },
 
+    // ===== Audio Playback =====
+    playAudio(url) {
+      const audio = new Audio(url)
+      
+      audio.onended = () => {
+        console.log('Audio playback ended')
+        if (this.inCallMode) {
+          this.callStatus = '等待...'
+        }
+      }
+      
+      audio.onerror = (e) => {
+        console.error('Audio playback error:', e)
+        if (this.inCallMode) {
+          this.callStatus = '播放出错'
+          setTimeout(() => {
+            if (this.inCallMode) this.callStatus = '等待...'
+          }, 2000)
+        }
+      }
+      
+      audio.play().catch(e => {
+        console.error('Play failed:', e)
+      })
+    },
+
+    // ===== Text Message =====
     sendText() {
       const text = this.textInput.trim()
       if (!text) return
 
       this.send({
         action: 'msg',
-        payload: {
-          userId: this.userId,
-          text: text
-        }
+        payload: { userId: this.userId, text }
       })
 
-      this.messages.push({
-        role: 'user',
-        text: text,
-        audioUrl: null
-      })
-      
+      this.messages.push({ role: 'user', text })
       this.textInput = ''
       this.scrollToBottom()
     },
 
-    onAudioPlay(msg) {
-      console.log('Playing audio for:', msg.text)
-    },
-
+    // ===== UI Helpers =====
     scrollToBottom() {
       this.$nextTick(() => {
         const chatArea = this.$refs.chatArea
@@ -317,6 +442,13 @@ export default {
           chatArea.scrollTop = chatArea.scrollHeight
         }
       })
+    },
+
+    getVoiceButtonText() {
+      if (this.isProcessing) return '处理中'
+      if (this.isRecording) return '识别中...'
+      if (this.inCallMode) return '说话中'
+      return '按住说话'
     },
 
     formatDuration(seconds) {
@@ -329,12 +461,14 @@ export default {
 </script>
 
 <style>
-.app {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #f5f5f5;
+  height: 100vh;
+  overflow: hidden;
 }
+.app { height: 100%; display: flex; flex-direction: column; }
 
 /* Status Bar */
 .status-bar {
@@ -344,7 +478,6 @@ export default {
   display: flex;
   justify-content: center;
 }
-
 .status {
   display: flex;
   align-items: center;
@@ -352,21 +485,14 @@ export default {
   font-size: 12px;
   color: #999;
 }
-
-.status.connected {
-  color: #34c759;
-}
-
+.status.connected { color: #34c759; }
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #999;
 }
-
-.status.connected .dot {
-  background: #34c759;
-}
+.status.connected .dot { background: #34c759; }
 
 /* Chat Area */
 .chat-area {
@@ -375,32 +501,20 @@ export default {
   padding: 15px;
   padding-bottom: 100px;
 }
-
 .empty-tip {
   text-align: center;
   padding-top: 100px;
   color: #999;
 }
-
-.empty-tip .sub {
-  font-size: 12px;
-  margin-top: 8px;
-}
+.empty-tip .sub { font-size: 12px; margin-top: 8px; }
 
 /* Messages */
 .message {
   display: flex;
   margin-bottom: 15px;
 }
-
-.message.user {
-  justify-content: flex-end;
-}
-
-.message.ai {
-  justify-content: flex-start;
-}
-
+.message.user { justify-content: flex-end; }
+.message.ai { justify-content: flex-start; }
 .bubble {
   max-width: 75%;
   padding: 10px 14px;
@@ -408,24 +522,16 @@ export default {
   font-size: 15px;
   line-height: 1.4;
 }
-
 .user .bubble {
   background: #007AFF;
   color: #fff;
   border-bottom-right-radius: 4px;
 }
-
 .ai .bubble {
   background: #fff;
   color: #333;
   border-bottom-left-radius: 4px;
   box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-}
-
-.bubble audio {
-  width: 100%;
-  margin-top: 8px;
-  height: 32px;
 }
 
 /* Typing */
@@ -439,55 +545,50 @@ export default {
   width: fit-content;
   box-shadow: 0 1px 3px rgba(0,0,0,0.1);
 }
-
 .typing .dot {
   width: 6px;
   height: 6px;
   background: #999;
   animation: typing 1.4s infinite;
 }
-
-.typing .dot:nth-child(2) {
-  animation-delay: 0.2s;
-}
-
-.typing .dot:nth-child(3) {
-  animation-delay: 0.4s;
-}
-
+.typing .dot:nth-child(2) { animation-delay: 0.2s; }
+.typing .dot:nth-child(3) { animation-delay: 0.4s; }
 @keyframes typing {
   0%, 60%, 100% { transform: translateY(0); }
   30% { transform: translateY(-4px); }
 }
 
-/* Recording Indicator */
-.recording-indicator {
+/* Call Indicator */
+.call-indicator {
   position: fixed;
-  top: 50%;
+  top: 50px;
   left: 50%;
-  transform: translate(-50%, -50%);
-  background: rgba(0,0,0,0.8);
+  transform: translateX(-50%);
+  background: #34c759;
   color: #fff;
-  padding: 20px 30px;
-  border-radius: 12px;
+  padding: 8px 20px;
+  border-radius: 20px;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(52, 199, 89, 0.3);
   z-index: 100;
 }
-
-.recording-dot {
-  width: 20px;
-  height: 20px;
-  background: #ff3b30;
+.call-pulse {
+  width: 10px;
+  height: 10px;
+  background: #fff;
   border-radius: 50%;
   animation: pulse 1s infinite;
 }
-
+.call-status {
+  font-size: 12px;
+  opacity: 0.8;
+}
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.2); }
 }
 
 /* Input Area */
@@ -504,7 +605,6 @@ export default {
   gap: 10px;
   border-top: 1px solid #e0e0e0;
 }
-
 .input-area input {
   flex: 1;
   height: 40px;
@@ -515,7 +615,6 @@ export default {
   font-size: 15px;
   outline: none;
 }
-
 .send-btn {
   height: 36px;
   padding: 0 16px;
@@ -526,39 +625,58 @@ export default {
   font-size: 14px;
   cursor: pointer;
 }
+.send-btn:disabled { background: #ccc; }
 
-.send-btn:disabled {
-  background: #ccc;
-}
-
-.voice-btn {
+/* Call Button */
+.call-btn {
+  width: 44px;
   height: 44px;
-  width: 80px;
   border: none;
   background: #f0f0f0;
-  border-radius: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.call-btn.active {
+  background: #34c759;
+  animation: call-pulse 2s infinite;
+}
+.call-btn .phone-icon { font-size: 20px; }
+@keyframes call-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.4); }
+  50% { box-shadow: 0 0 0 10px rgba(52, 199, 89, 0); }
+}
+
+/* Voice Button */
+.voice-btn {
+  flex: 1;
+  height: 50px;
+  border: none;
+  background: #007AFF;
+  border-radius: 25px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 0.2s;
+  transition: all 0.2s;
 }
-
 .voice-btn.recording {
   background: #ff3b30;
+  animation: recording-pulse 1s infinite;
 }
-
-.mic-icon {
-  font-size: 18px;
+.voice-btn.listening {
+  background: #34c759;
 }
-
+.mic-icon { font-size: 20px; }
 .hold-tip {
-  font-size: 10px;
-  color: #666;
+  font-size: 11px;
+  color: rgba(255,255,255,0.8);
 }
-
-.voice-btn.recording .hold-tip {
-  color: #fff;
+@keyframes recording-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
 }
 </style>
