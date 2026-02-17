@@ -14,6 +14,14 @@
       <div class="status-text">
         {{ getStatusText() }}
       </div>
+      
+      <!-- Debug Info -->
+      <div class="debug-info" v-if="showDebug">
+        <div>VAD: {{ vadActive ? 'ON' : 'OFF' }}</div>
+        <div>Recording: {{ isRecording ? 'YES' : 'NO' }}</div>
+        <div>Processing: {{ isProcessing ? 'YES' : 'NO' }}</div>
+        <div>Volume: {{ lastVolume }}</div>
+      </div>
     </div>
   </div>
 </template>
@@ -44,7 +52,10 @@ export default {
       token: 'voice_9527_secret_key_2026',
       vadThreshold: 0.01,
       vadSilenceThreshold: 1500,
-      lastSpeechTime: 0
+      lastSpeechTime: 0,
+      vadActive: false,
+      lastVolume: 0,
+      showDebug: true
     }
   },
   mounted() {
@@ -221,6 +232,7 @@ export default {
     // ===== VAD =====
     startVAD() {
       if (this.vadInterval) return
+      this.vadActive = true
       
       const dataArray = new Uint8Array(this.analyser.frequencyBinCount)
       
@@ -230,16 +242,19 @@ export default {
         this.analyser.getByteFrequencyData(dataArray)
         const average = dataArray.reduce((a, b) => a + b) / dataArray.length
         const volume = average / 255
+        this.lastVolume = Math.round(volume * 100)
         
         const now = Date.now()
         
         if (volume > this.vadThreshold) {
           this.lastSpeechTime = now
           if (!this.isRecording) {
+            console.log('VAD: Speech detected, starting recording')
             this.startRecording()
           }
         } else {
           if (this.isRecording && (now - this.lastSpeechTime) > this.vadSilenceThreshold) {
+            console.log('VAD: Silence detected, stopping recording')
             this.stopRecording()
           }
         }
@@ -470,5 +485,13 @@ body {
   font-size: 18px;
   color: #666;
   min-height: 24px;
+}
+
+.debug-info {
+  font-size: 12px;
+  color: #888;
+  text-align: center;
+  margin-top: 20px;
+  line-height: 1.6;
 }
 </style>
