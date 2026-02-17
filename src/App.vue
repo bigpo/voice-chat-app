@@ -4,7 +4,7 @@
     <div class="status-bar">
       <div class="status" :class="{ connected: isConnected }">
         <span class="dot"></span>
-        {{ isConnected ? '已连接' : '连接中...' }}
+        {{ connectionStatus }}
       </div>
     </div>
 
@@ -103,6 +103,12 @@ export default {
       serverUrl: 'ws://154.89.149.198:8765/ws',
       token: 'voice_9527_secret_key_2026',
       
+      // Connection tracking
+      connectionStatus: '连接中...',
+      reconnectAttempts: 0,
+      reconnectTimer: null,
+      connectionTimeout: null,
+      
       // Call mode
       inCallMode: false,
       callStatus: '等待...',
@@ -123,44 +129,95 @@ export default {
   methods: {
     // ===== WebSocket =====
     connectWebSocket() {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        return // Already connected
+      }
+      
       console.log('Connecting to', this.serverUrl)
-      this.ws = new WebSocket(this.serverUrl)
-
-      this.ws.onopen = () => {
-        console.log('WS Connected')
-        this.isConnected = true
-        this.send({
-          action: 'auth',
-          payload: { userId: this.userId, token: this.token }
-        })
-      }
-
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          console.log('WS Received:', data)
-          this.handleMessage(data)
-        } catch (e) {
-          console.error('Parse error:', e)
+      this.connectionStatus = '连接中...'
+      
+      try {
+        this.ws = new WebSocket(this.serverUrl)
+        
+        // Connection timeout
+        this.connectionTimeout = setTimeout(() => {
+          if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
+            console.log('WS Connection timeout, retrying...')
+            this.ws.close()
+            this.reconnectAttempts++
+            this.scheduleReconnect()
+          }
+        }, 10000)
+        
+        this.ws.onopen = () => {
+          console.log('WS Connected')
+          clearTimeout(this.connectionTimeout)
+          this.isConnected = true
+          this.connectionStatus = '已连接'
+          this.reconnectAttempts = 0
+          
+          this.send({
+            action: 'auth',
+            payload: { userId: this.userId, token: this.token }
+          })
         }
-      }
 
-      this.ws.onclose = () => {
-        console.log('WS Disconnected')
-        this.isConnected = false
-        setTimeout(() => this.connectWebSocket(), 3000)
-      }
+        this.ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data)
+            console.log('WS Received:', data)
+            this.handleMessage(data)
+          } catch (e) {
+            console.error('Parse error:', e)
+          }
+        }
 
-      this.ws.onerror = (err) => {
-        console.error('WS Error:', err)
+        this.ws.onclose = (e) => {
+          console.log('WS Disconnected:', e.code, e.reason)
+          clearTimeout(this.connectionTimeout)
+          this.isConnected = false
+          this.connectionStatus = '断开连接'
+          this.scheduleReconnect()
+        }
+
+        this.ws.onerror = (err) => {
+          console.error('WS Error:', err)
+          clearTimeout(this.connectionTimeout)
+          this.connectionStatus = '连接错误'
+        }
+      } catch (e) {
+        console.error('WS Creation error:', e)
+        this.connectionStatus = '连接失败'
+        this.scheduleReconnect()
       }
     },
 
+    scheduleReconnect() {
+      if (this.reconnectTimer) return
+      
+      // Exponential backoff
+      const delay = Math.min(3000 * Math.pow(2, this.reconnectAttempts), 30000)
+      console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`)
+      
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null
+        this.connectWebSocket()
+      }, delay)
+    },
+
     disconnectWebSocket() {
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer)
+        this.reconnectTimer = null
+      }
+      if (this.connectionTimeout) {
+        clearTimeout(this.connectionTimeout)
+      }
       if (this.ws) {
         this.ws.close()
         this.ws = null
       }
+      this.isConnected = false
     },
 
     send(data) {
@@ -236,16 +293,23 @@ export default {
 
     async enterCallMode() {
       try {
+        // Show loading state
+        this.callStatus = '请求麦克风权限...'
+        
         // First request permission - this will show the system prompt
         const hasPermission = await this.requestMicrophonePermission()
         console.log('Permission result:', hasPermission)
         
-        // Request microphone
+        this.callStatus = '打开麦克风...'
+        
+        // Request microphone with explicit settings for Android
         this.stream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true
+            autoGainControl: true,
+            // For Android WebView
+            deviceId: undefined
           } 
         })
         
@@ -267,7 +331,7 @@ export default {
         console.error('Failed to enter call mode:', e)
         // More helpful error message
         if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
-          alert('请在系统设置中允许应用使用麦克风权限')
+          alert('麦克风权限被拒绝！\n\n请到手机设置 → 应用 → 语音助手 → 权限 → 允许麦克风')
         } else if (e.name === 'NotFoundError') {
           alert('未找到麦克风设备')
         } else {
