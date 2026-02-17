@@ -217,7 +217,10 @@ export default {
         console.log('[Mic Test] Initial volume:', testVolume)
         
         this.callStatus = 'ready'
-        // Don't start VAD here - wait for auth_ok
+        
+        // Start VAD immediately for debugging
+        console.log('[Call] Starting VAD now')
+        this.startVAD()
         
       } catch (e) {
         console.error('Failed to enter call mode:', e)
@@ -248,8 +251,13 @@ export default {
 
     // ===== VAD =====
     startVAD() {
+      if (!this.analyser) {
+        console.error('[VAD] Analyser not initialized!')
+        return
+      }
       if (this.vadInterval) return
       this.vadActive = true
+      console.log('[VAD] Starting...')
       
       const dataArray = new Uint8Array(this.analyser.frequencyBinCount)
       
