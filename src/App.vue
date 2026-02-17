@@ -286,6 +286,14 @@ export default {
       this.callStatus = 'processing'
       
       const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
+      
+      // Convert to wav using AudioContext
+      const arrayBuffer = await audioBlob.arrayBuffer()
+      const audioCtx = new AudioContext()
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+      
+      // Convert to WAV
+      const wavBlob = this.audioBufferToWav(audioBuffer)
       const reader = new FileReader()
       
       reader.onload = () => {
@@ -293,13 +301,73 @@ export default {
         
         this.send({
           action: 'audio',
-          payload: { userId: this.userId, data: base64, format: 'webm' }
+          payload: { userId: this.userId, data: base64, format: 'wav' }
         })
         
         this.audioChunks = []
+        audioCtx.close()
       }
       
-      reader.readAsDataURL(audioBlob)
+      reader.readAsDataURL(wavBlob)
+    },
+    
+    audioBufferToWav(buffer) {
+      const numChannels = buffer.numberOfChannels
+      const sampleRate = buffer.sampleRate
+      const format = 1 // PCM
+      const bitDepth = 16
+      
+      const result = this.interleave(buffer)
+      const dataLength = result.length * 2
+      const headerLength = 44
+      const totalLength = headerLength + dataLength
+      
+      const header = new ArrayBuffer(headerLength)
+      const view = new DataView(header)
+      
+      const writeString = (view, offset, string) => {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i))
+        }
+      }
+      
+      writeString(view, 0, 'RIFF')
+      view.setUint32(4, 36 + dataLength, true)
+      writeString(view, 8, 'WAVE')
+      writeString(view, 12, 'fmt ')
+      view.setUint32(16, 16, true)
+      view.setUint16(20, format, true)
+      view.setUint16(22, numChannels, true)
+      view.setUint32(24, sampleRate, true)
+      view.setUint32(28, sampleRate * numChannels * 2, true)
+      view.setUint16(32, numChannels * 2, true)
+      view.setUint16(34, bitDepth, true)
+      writeString(view, 36, 'data')
+      view.setUint32(40, dataLength, true)
+      
+      const wavData = new Int16Array(result)
+      const wavBlob = new Blob([header, wavData], { type: 'audio/wav' })
+      return wavBlob
+    },
+    
+    interleave(buffer) {
+      const numChannels = buffer.numberOfChannels
+      const length = buffer.length
+      const result = new Float32Array(length * numChannels)
+      
+      const channels = []
+      for (let i = 0; i < numChannels; i++) {
+        channels.push(buffer.getChannelData(i))
+      }
+      
+      let index = 0
+      for (let i = 0; i < length; i++) {
+        for (let j = 0; j < numChannels; j++) {
+          result[index++] = channels[j][i]
+        }
+      }
+      
+      return result
     },
 
     // ===== Audio Playback =====
