@@ -120,6 +120,7 @@ export default {
           console.log('Auth OK')
           if (this.inCallMode) {
             this.callStatus = 'ready'
+            this.startVAD()  // Start VAD after auth
           }
           break
 
@@ -139,7 +140,9 @@ export default {
           if (payload.audioUrl) {
             this.playAudio(payload.audioUrl)
           } else {
+            // No audio, restart VAD immediately
             this.callStatus = 'ready'
+            this.startVAD()
           }
           break
       }
@@ -157,7 +160,7 @@ export default {
     async enterCallMode() {
       // Check if browser supports getUserMedia
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        alert('抱歉，您的浏览器不支持语音功能。\n\n请使用以下方式：\n1. 安装 APP 版本\n2. 或使用 HTTPS 访问')
+        alert('抱歉，您的浏览器不支持语音功能。\n\n请使用 APP 版本')
         return
       }
       
@@ -186,7 +189,7 @@ export default {
         source.connect(this.analyser)
         
         this.callStatus = 'ready'
-        this.startVAD()
+        // Don't start VAD here - wait for auth_ok
         
       } catch (e) {
         console.error('Failed to enter call mode:', e)
@@ -199,6 +202,8 @@ export default {
     leaveCallMode() {
       this.inCallMode = false
       this.stopVAD()
+      this.isRecording = false
+      this.isProcessing = false
       
       if (this.stream) {
         this.stream.getTracks().forEach(track => track.stop())
@@ -215,6 +220,8 @@ export default {
 
     // ===== VAD =====
     startVAD() {
+      if (this.vadInterval) return
+      
       const dataArray = new Uint8Array(this.analyser.frequencyBinCount)
       
       this.vadInterval = setInterval(() => {
@@ -282,6 +289,9 @@ export default {
     async sendAudio() {
       if (this.audioChunks.length === 0) return
 
+      // Stop VAD - AI is processing
+      this.stopVAD()
+      
       this.isProcessing = true
       this.callStatus = 'processing'
       
@@ -375,13 +385,15 @@ export default {
       const audio = new Audio(url)
       
       audio.onended = () => {
-        console.log('Playback ended')
+        console.log('Playback ended, restarting VAD')
         this.callStatus = 'ready'
+        this.startVAD()  // Restart VAD after TTS done
       }
       
       audio.onerror = (e) => {
         console.error('Playback error:', e)
         this.callStatus = 'ready'
+        this.startVAD()  // Restart VAD even on error
       }
       
       audio.play().catch(e => console.error('Play failed:', e))
