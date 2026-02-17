@@ -21,6 +21,7 @@
         <div>Recording: {{ isRecording ? 'YES' : 'NO' }}</div>
         <div>Processing: {{ isProcessing ? 'YES' : 'NO' }}</div>
         <div>Volume: {{ lastVolume }}</div>
+        <div v-if="asrText">ASR: {{ asrText }}</div>
       </div>
     </div>
   </div>
@@ -55,7 +56,8 @@ export default {
       lastSpeechTime: 0,
       vadActive: false,
       lastVolume: 0,
-      showDebug: true
+      showDebug: true,
+      asrText: ''
     }
   },
   mounted() {
@@ -141,7 +143,8 @@ export default {
           break
 
         case 'asr_result':
-          // User speech recognized
+          // User speech recognized - show on screen
+          this.asrText = payload?.text || '(无识别结果)'
           break
 
         case 'reply':
@@ -297,10 +300,10 @@ export default {
     startRecording() {
       if (this.isRecording) return
       
+      // Clear previous ASR result
+      this.asrText = ''
+      
       try {
-        // Limit recording to 10 seconds max
-        const maxDuration = 10000
-        
         this.mediaRecorder = new MediaRecorder(this.stream, {
           mimeType: 'audio/webm;codecs=opus'
         })
@@ -319,14 +322,6 @@ export default {
         
         this.isRecording = true
         this.callStatus = 'listening'
-        
-        // Auto-stop after max duration
-        setTimeout(() => {
-          if (this.isRecording) {
-            console.log('[Recording] Max duration reached')
-            this.stopRecording()
-          }
-        }, maxDuration)
         
       } catch (e) {
         console.error('Recording error:', e)
