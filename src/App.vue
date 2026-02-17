@@ -50,7 +50,7 @@ export default {
       userId: 'user_' + Math.random().toString(36).substr(2, 9),
       serverUrl: 'ws://154.89.149.198:8765/ws',
       token: 'voice_9527_secret_key_2026',
-      vadThreshold: 0.01,
+      vadThreshold: 0.005,  // Lower threshold
       vadSilenceThreshold: 1500,
       lastSpeechTime: 0,
       vadActive: false,
@@ -124,11 +124,12 @@ export default {
     },
 
     handleMessage(data) {
+      console.log('[WS] Received:', data.action)
       const { action, payload } = data
 
       switch (action) {
         case 'auth_ok':
-          console.log('Auth OK')
+          console.log('Auth OK, starting VAD')
           if (this.inCallMode) {
             this.callStatus = 'ready'
             this.startVAD()  // Start VAD after auth
@@ -189,15 +190,31 @@ export default {
         
         // Request microphone
         this.stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: { echoCancellation: true, noiseSuppression: true } 
+          audio: { 
+            echoCancellation: true, 
+            noiseSuppression: true,
+            autoGainControl: true
+          } 
         })
         
         // Setup audio analysis for VAD
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)()
+        
+        // Resume audio context (required for Android)
+        if (this.audioContext.state === 'suspended') {
+          await this.audioContext.resume()
+        }
+        
         const source = this.audioContext.createMediaStreamSource(this.stream)
         this.analyser = this.audioContext.createAnalyser()
         this.analyser.fftSize = 256
         source.connect(this.analyser)
+        
+        // Test if analyser is working
+        const testData = new Uint8Array(this.analyser.frequencyBinCount)
+        this.analyser.getByteFrequencyData(testData)
+        const testVolume = testData.reduce((a, b) => a + b) / testData.length
+        console.log('[Mic Test] Initial volume:', testVolume)
         
         this.callStatus = 'ready'
         // Don't start VAD here - wait for auth_ok
