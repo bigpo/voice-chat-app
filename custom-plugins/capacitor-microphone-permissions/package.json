@@ -1,0 +1,9 @@
+{
+  "name": "capacitor-microphone-permissions",
+  "version": "1.0.0",
+  "description": "Add microphone permissions to Android",
+  "main": "index.js",
+  "keywords": ["capacitor"],
+  "author": "",
+  "license": "MIT"
+}

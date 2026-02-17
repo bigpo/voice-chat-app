@@ -229,10 +229,25 @@ export default {
       }
     },
 
+    async requestMicrophonePermission() {
+      // For browser, getUserMedia will prompt for permission
+      return true
+    },
+
     async enterCallMode() {
       try {
-        // Request microphone permission
-        this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        // First request permission - this will show the system prompt
+        const hasPermission = await this.requestMicrophonePermission()
+        console.log('Permission result:', hasPermission)
+        
+        // Request microphone
+        this.stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          } 
+        })
         
         // Setup audio context for VAD
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)()
@@ -250,7 +265,14 @@ export default {
         
       } catch (e) {
         console.error('Failed to enter call mode:', e)
-        alert('无法访问麦克风，请检查权限')
+        // More helpful error message
+        if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          alert('请在系统设置中允许应用使用麦克风权限')
+        } else if (e.name === 'NotFoundError') {
+          alert('未找到麦克风设备')
+        } else {
+          alert('无法访问麦克风: ' + e.message)
+        }
       }
     },
 

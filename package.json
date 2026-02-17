@@ -9,18 +9,19 @@
     "android": "npx cap sync android && npx cap open android"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "@capacitor/core": "^6.0.0",
     "@capacitor/android": "^6.0.0",
     "@capacitor/app": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
     "@capacitor/haptics": "^6.0.0",
     "@capacitor/keyboard": "^6.0.0",
+    "@capacitor/network": "^6.0.0",
     "@capacitor/status-bar": "^6.0.0",
-    "@capacitor/network": "^6.0.0"
+    "capacitor-microphone-permissions": "file:custom-plugins/capacitor-microphone-permissions",
+    "vue": "^3.4.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
     "@vitejs/plugin-vue": "^5.0.0",
-    "vite": "^5.0.0",
-    "@capacitor/cli": "^6.0.0"
+    "vite": "^5.0.0"
   }
 }
