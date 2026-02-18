@@ -1,27 +1,47 @@
 <template>
   <div class="app">
-    <!-- Call Button -->
-    <div class="call-container">
+    <div class="container">
+      <h1>🎙️ 语音助手</h1>
+      
+      <!-- Voice Button -->
       <button 
-        class="call-btn" 
-        :class="{ active: inCallMode }"
-        @click="toggleCall"
+        class="voice-button" 
+        :class="{ listening: isListening }"
+        @mousedown="startRecording"
+        @mouseup="stopRecording"
+        @touchstart.prevent="startRecording"
+        @touchend.prevent="stopRecording"
       >
-        <span class="phone-icon">{{ inCallMode ? '📞' : '📴' }}</span>
+        {{ isListening ? '正在听...' : (continuousMode ? '点击说话' : '按住说话') }}
       </button>
       
-      <!-- Status -->
-      <div class="status-text">
-        {{ getStatusText() }}
+      <!-- Continuous Mode Toggle -->
+      <div class="continuous-toggle">
+        <label class="toggle-switch">
+          <input type="checkbox" v-model="continuousMode">
+          <span class="toggle-slider"></span>
+        </label>
+        <span class="toggle-label">连续对话</span>
       </div>
       
-      <!-- Debug Info -->
-      <div class="debug-info" v-if="showDebug">
-        <div>VAD: {{ vadActive ? 'ON' : 'OFF' }}</div>
-        <div>Listening: {{ isListening ? 'YES' : 'NO' }}</div>
-        <div>Processing: {{ isProcessing ? 'YES' : 'NO' }}</div>
-        <div v-if="transcript">ASR: {{ transcript }}</div>
-        <div v-if="aiResponse">AI: {{ aiResponse }}</div>
+      <!-- Status -->
+      <p class="status" :class="{ active: isListening || isProcessing }">{{ statusText }}</p>
+      
+      <!-- Transcript -->
+      <div class="transcript-box">
+        <h3>对话</h3>
+        <div v-if="!transcript && !aiResponse" class="empty-tip">
+          {{ continuousMode ? '点击按钮开始对话' : '按住按钮说话' }}
+        </div>
+        <div v-else>
+          <p v-if="transcript" class="user"><strong>你:</strong> {{ transcript }}</p>
+          <p v-if="aiResponse" class="assistant"><strong>AI:</strong> {{ aiResponse }}</p>
+        </div>
+      </div>
+      
+      <!-- Controls -->
+      <div class="controls">
+        <button @click="clearHistory">清除记录</button>
       </div>
     </div>
   </div>
@@ -34,194 +54,156 @@ export default {
     return {
       ws: null,
       isConnected: false,
-      inCallMode: false,
       isListening: false,
       isProcessing: false,
-      callStatus: 'idle',
+      continuousMode: false,
+      statusText: '就绪',
+      transcript: '',
+      aiResponse: '',
       
       // Audio
-      stream: null,
+      mediaStream: null,
       audioContext: null,
-      mediaRecorder: null,
-      audioChunks: [],
+      audioProcessor: null,
+      audioSource: null,
       
-      // Config - OpenClaw Voice protocol
-      serverUrl: 'ws://154.89.149.198:8765/ws',
-      showDebug: true,
-      transcript: '',
-      aiResponse: ''
+      // Config
+      serverUrl: 'ws://154.89.149.198:8765/ws'
     }
   },
   mounted() {
     this.connectWebSocket()
   },
   beforeUnmount() {
-    this.leaveCallMode()
-    this.disconnectWebSocket()
+    this.disconnect()
   },
   methods: {
-    // ===== WebSocket =====
     connectWebSocket() {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) return
+      this.statusText = '连接中...'
       
-      this.callStatus = 'connecting'
-      console.log('Connecting to', this.serverUrl)
+      this.ws = new WebSocket(this.serverUrl)
       
-      try {
-        this.ws = new WebSocket(this.serverUrl)
-        
-        this.ws.onopen = () => {
-          console.log('WS Connected')
-          this.isConnected = true
-          this.callStatus = 'ready'
-        }
-
-        this.ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data)
-            console.log('WS Received:', data.type)
-            this.handleMessage(data)
-          } catch (e) {
-            console.error('Parse error:', e)
-          }
-        }
-
-        this.ws.onclose = () => {
-          console.log('WS Disconnected')
-          this.isConnected = false
-          this.callStatus = 'disconnected'
-          if (this.inCallMode) {
-            setTimeout(() => this.connectWebSocket(), 3000)
-          }
-        }
-
-        this.ws.onerror = (err) => {
-          console.error('WS Error:', err)
-          this.callStatus = 'error'
-        }
-      } catch (e) {
-        console.error('WS Creation error:', e)
-        this.callStatus = 'error'
+      this.ws.onopen = () => {
+        console.log('WS Connected')
+        this.isConnected = true
+        this.statusText = '就绪'
       }
-    },
 
-    disconnectWebSocket() {
-      if (this.ws) {
-        this.ws.close()
-        this.ws = null
+      this.ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          console.log('WS:', data.type)
+          this.handleMessage(data)
+        } catch (e) {
+          console.error('Parse error:', e)
+        }
       }
-    },
 
-    send(data) {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(data))
+      this.ws.onclose = () => {
+        console.log('WS Disconnected')
+        this.isConnected = false
+        this.statusText = '断开连接'
+        setTimeout(() => this.connectWebSocket(), 3000)
+      }
+
+      this.ws.onerror = (err) => {
+        console.error('WS Error:', err)
+        this.statusText = '连接错误'
       }
     },
 
     handleMessage(data) {
-      const { type, text, final } = data
-
+      const { type, text } = data
+      
       switch (type) {
         case 'listening_started':
-          console.log('Started listening')
           this.isListening = true
+          this.statusText = this.continuousMode ? '🎙️ 正在听...' : '正在听...'
           break
           
         case 'listening_stopped':
-          console.log('Stopped listening')
           this.isListening = false
+          this.statusText = '处理中...'
           break
           
         case 'transcript':
-          if (final) {
+          if (data.final) {
             this.transcript = text
-            console.log('Final transcript:', text)
+            this.statusText = 'AI 回复中...'
           }
           break
           
         case 'response_chunk':
           this.aiResponse = (this.aiResponse || '') + text
+          this.statusText = '说话中...'
           break
           
         case 'audio_chunk':
-          // Play audio chunk
           this.playAudioChunk(data.data)
           break
           
         case 'response_complete':
-          console.log('Response complete:', text)
           this.isProcessing = false
-          this.callStatus = 'ready'
-          // Restart listening
-          this.startListening()
-          break
-          
-        case 'vad_status':
-          console.log('VAD:', data.speech_detected)
+          this.statusText = this.continuousMode ? '🎙️ 就绪' : '就绪'
+          if (this.continuousMode) {
+            setTimeout(() => this.startRecording(), 500)
+          }
           break
       }
     },
 
-    // ===== Call Control =====
-    async toggleCall() {
-      if (this.inCallMode) {
-        this.leaveCallMode()
-      } else {
-        await this.enterCallMode()
-      }
-    },
-
-    async enterCallMode() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        alert('抱歉，您的浏览器不支持语音功能。\n\n请使用 APP 版本')
-        return
-      }
+    async startRecording() {
+      if (this.isListening || this.isProcessing) return
       
       try {
-        this.inCallMode = true
-        this.callStatus = 'connecting'
-        
-        // Connect WebSocket
-        if (!this.isConnected) {
-          this.connectWebSocket()
-          await new Promise(resolve => setTimeout(resolve, 2000))
+        // Get microphone
+        if (!this.mediaStream) {
+          this.mediaStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+          })
         }
         
-        // Request microphone
-        this.stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: { 
-            echoCancellation: true, 
-            noiseSuppression: true,
-            autoGainControl: true
-          } 
-        })
+        // Setup audio processing
+        this.audioContext = new AudioContext({ sampleRate: 16000 })
+        this.audioSource = this.audioContext.createMediaStreamSource(this.mediaStream)
+        this.audioProcessor = this.audioContext.createScriptProcessor(4096, 1, 1)
         
-        // Setup audio context
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)()
-        if (this.audioContext.state === 'suspended') {
-          await this.audioContext.resume()
+        this.audioProcessor.onaudioprocess = (e) => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            const audioData = e.inputBuffer.getChannelData(0)
+            const base64 = this.float32ToBase64(audioData)
+            this.ws.send(JSON.stringify({ type: 'audio', data: base64 }))
+          }
         }
         
-        this.callStatus = 'ready'
+        this.audioSource.connect(this.audioProcessor)
+        this.audioProcessor.connect(this.audioContext.destination)
         
-        // Start listening
-        this.startListening()
+        this.isListening = true
+        this.transcript = ''
+        this.aiResponse = ''
+        
+        this.ws.send(JSON.stringify({ type: 'start_listening' }))
         
       } catch (e) {
-        console.error('Failed to enter call mode:', e)
-        this.inCallMode = false
-        this.callStatus = 'error'
+        console.error('Recording error:', e)
         alert('无法打开麦克风: ' + e.message)
       }
     },
 
-    leaveCallMode() {
-      this.inCallMode = false
-      this.stopListening()
+    stopRecording() {
+      if (!this.isListening) return
       
-      if (this.stream) {
-        this.stream.getTracks().forEach(track => track.stop())
-        this.stream = null
+      this.isListening = false
+      
+      if (this.audioProcessor) {
+        this.audioProcessor.disconnect()
+        this.audioProcessor = null
+      }
+      
+      if (!this.continuousMode && this.audioSource) {
+        this.audioSource.disconnect()
+        this.audioSource = null
       }
       
       if (this.audioContext) {
@@ -229,104 +211,11 @@ export default {
         this.audioContext = null
       }
       
-      this.callStatus = 'idle'
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'stop_listening' }))
+      }
     },
 
-    // ===== Audio Recording =====
-    startListening() {
-      if (!this.stream || !this.audioContext) return
-      
-      this.isListening = true
-      this.transcript = ''
-      this.aiResponse = ''
-      
-      // Send start_listening
-      this.send({ type: 'start_listening' })
-      
-      // Create audio recorder
-      this.mediaRecorder = new MediaRecorder(this.stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      })
-      
-      this.audioChunks = []
-      
-      this.mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          this.audioChunks.push(e.data)
-        }
-      }
-      
-      this.mediaRecorder.onstop = () => {
-        this.processAudio()
-      }
-      
-      // Start recording with timeslice
-      this.mediaRecorder.start(100)
-    },
-
-    stopListening() {
-      if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
-        this.mediaRecorder.stop()
-      }
-      this.isListening = false
-      
-      // Send stop_listening
-      this.send({ type: 'stop_listening' })
-    },
-
-    async processAudio() {
-      if (this.audioChunks.length === 0) return
-      
-      this.isProcessing = true
-      this.callStatus = 'processing'
-      this.stopListening()
-      
-      try {
-        // Convert to PCM float32
-        const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' })
-        const arrayBuffer = await audioBlob.arrayBuffer()
-        const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer)
-        
-        // Get PCM data
-        const channelData = audioBuffer.getChannelData(0)
-        
-        // Convert to base64
-        const pcmData = this.floatToBase64(channelData)
-        
-        // Send audio
-        this.send({
-          type: 'audio',
-          data: pcmData
-        })
-        
-      } catch (e) {
-        console.error('Audio processing error:', e)
-        this.isProcessing = false
-        this.callStatus = 'ready'
-        this.startListening()
-      }
-      
-      this.audioChunks = []
-    },
-
-    floatToBase64(float32Array) {
-      // Convert float32 to 16-bit PCM
-      const int16Array = new Int16Array(float32Array.length)
-      for (let i = 0; i < float32Array.length; i++) {
-        const s = Math.max(-1, Math.min(1, float32Array[i]))
-        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
-      }
-      
-      // Convert to base64
-      let binary = ''
-      const bytes = new Uint8Array(int16Array.buffer)
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i])
-      }
-      return btoa(binary)
-    },
-
-    // ===== Audio Playback =====
     playAudioChunk(base64Data) {
       try {
         const binary = atob(base64Data)
@@ -335,17 +224,18 @@ export default {
           bytes[i] = binary.charCodeAt(i)
         }
         
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-        const audioBuffer = audioCtx.createBuffer(1, bytes.length / 2, 16000)
-        const channelData = audioBuffer.getChannelData(0)
-        
         const int16Array = new Int16Array(bytes.buffer)
+        const float32Array = new Float32Array(int16Array.length)
         for (let i = 0; i < int16Array.length; i++) {
-          channelData[i] = int16Array[i] / 32768.0
+          float32Array[i] = int16Array[i] / 32768.0
         }
         
+        const audioCtx = new AudioContext()
+        const buffer = audioCtx.createBuffer(1, float32Array.length, 16000)
+        buffer.getChannelData(0).set(float32Array)
+        
         const source = audioCtx.createBufferSource()
-        source.buffer = audioBuffer
+        source.buffer = buffer
         source.connect(audioCtx.destination)
         source.start()
       } catch (e) {
@@ -353,17 +243,29 @@ export default {
       }
     },
 
-    // ===== UI =====
-    getStatusText() {
-      switch (this.callStatus) {
-        case 'idle': return '点击拨打'
-        case 'connecting': return '连接中...'
-        case 'ready': return '请说话'
-        case 'listening': return '正在听...'
-        case 'processing': return 'AI 处理中...'
-        case 'disconnected': return '断开连接'
-        case 'error': return '连接错误'
-        default: return ''
+    float32ToBase64(float32Array) {
+      const bytes = new Uint8Array(float32Array.buffer)
+      let binary = ''
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i])
+      }
+      return btoa(binary)
+    },
+
+    clearHistory() {
+      this.transcript = ''
+      this.aiResponse = ''
+    },
+
+    disconnect() {
+      this.stopRecording()
+      if (this.mediaStream) {
+        this.mediaStream.getTracks().forEach(track => track.stop())
+        this.mediaStream = null
+      }
+      if (this.ws) {
+        this.ws.close()
+        this.ws = null
       }
     }
   }
@@ -374,63 +276,180 @@ export default {
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: #1a1a1a;
-  height: 100vh;
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  color: #fff;
+  min-height: 100vh;
 }
 .app {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-}
-
-.call-container {
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 30px;
+  padding: 20px;
 }
 
-.call-btn {
-  width: 120px;
-  height: 120px;
-  border-radius: 60px;
-  border: none;
-  background: #333;
-  cursor: pointer;
-  transition: all 0.3s;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-}
-
-.call-btn.active {
-  background: #34c759;
-  animation: call-pulse 2s infinite;
-}
-
-.phone-icon {
-  font-size: 48px;
-}
-
-@keyframes call-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0.4); }
-  50% { box-shadow: 0 0 0 20px rgba(52, 199, 89, 0); }
-}
-
-.status-text {
-  font-size: 18px;
-  color: #666;
-  min-height: 24px;
-}
-
-.debug-info {
-  font-size: 12px;
-  color: #888;
+.container {
+  max-width: 600px;
+  width: 100%;
   text-align: center;
-  margin-top: 20px;
+}
+
+h1 {
+  font-size: 2rem;
+  margin-bottom: 10px;
+  background: linear-gradient(90deg, #ff6b35, #f7c94b);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.voice-button {
+  width: 150px;
+  height: 150px;
+  border-radius: 50%;
+  border: none;
+  background: linear-gradient(135deg, #ff6b35 0%, #e55a2b 100%);
+  color: white;
+  font-size: 1.2rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 10px 40px rgba(255, 107, 53, 0.3);
+  margin: 30px auto;
+}
+
+.voice-button:active,
+.voice-button.listening {
+  transform: scale(0.95);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 10px 40px rgba(255, 107, 53, 0.3); }
+  50% { box-shadow: 0 10px 60px rgba(255, 107, 53, 0.6); }
+}
+
+.continuous-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.toggle-switch {
+  position: relative;
+  width: 56px;
+  height: 30px;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #333;
+  border-radius: 30px;
+  transition: 0.3s;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 22px;
+  width: 22px;
+  left: 4px;
+  bottom: 4px;
+  background: white;
+  border-radius: 50%;
+  transition: 0.3s;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: #ff6b35;
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(26px);
+}
+
+.toggle-label {
+  font-weight: 600;
+  color: #fff;
+}
+
+.status {
+  font-size: 1.1rem;
+  color: #888;
+  margin-bottom: 20px;
+}
+
+.status.active {
+  color: #ff6b35;
+}
+
+.transcript-box {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 20px;
+  text-align: left;
+  min-height: 100px;
+}
+
+.transcript-box h3 {
+  font-size: 0.9rem;
+  color: #666;
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.transcript-box p {
+  font-size: 1rem;
   line-height: 1.6;
+  margin-bottom: 10px;
+}
+
+.transcript-box p.user {
+  color: #ff6b35;
+}
+
+.transcript-box p.assistant {
+  color: #4fc3f7;
+}
+
+.empty-tip {
+  color: #666;
+  text-align: center;
+  padding: 20px;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.controls button {
+  padding: 10px 20px;
+  border: 1px solid #444;
+  background: transparent;
+  color: #888;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.controls button:hover {
+  border-color: #ff6b35;
+  color: #ff6b35;
 }
 </style>
