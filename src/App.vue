@@ -143,9 +143,16 @@ export default {
       this.voiceApiKey = queryVoiceKey || envVoiceKey || savedVoiceKey
       if (queryVoiceKey) localStorage.setItem('voice_api_key', queryVoiceKey)
 
-      if (this.useAppAsr && !this.asrApiKey) {
-        console.warn('App ASR disabled: missing DASHSCOPE API key')
-        this.useAppAsr = false
+      if (!this.asrApiKey) {
+        if (this.useAppAsr) {
+          console.warn('App ASR disabled: missing DASHSCOPE API key')
+          this.useAppAsr = false
+        }
+        if (this.useAppTts) {
+          console.warn('App TTS disabled: missing DASHSCOPE API key, fallback to server TTS')
+          this.useAppTts = false
+          this.useStreamingAppTts = false
+        }
       }
     },
 
@@ -266,6 +273,10 @@ export default {
           }
         } catch (e) {
           console.error('App TTS failed:', e)
+          // 下轮自动回退到服务端 TTS，避免“有字无声”
+          this.useAppTts = false
+          this.useStreamingAppTts = false
+          this.statusText = 'App TTS失败，下一轮回退服务端语音'
         }
       }
 
@@ -598,6 +609,9 @@ export default {
         }
       } catch (e) {
         console.error('Streaming App TTS failed:', e)
+        this.useAppTts = false
+        this.useStreamingAppTts = false
+        this.statusText = 'App TTS失败，下一轮回退服务端语音'
       } finally {
         this.ttsPlaying = false
         this.resolveTtsWaitersIfIdle()
