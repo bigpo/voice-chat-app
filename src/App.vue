@@ -42,6 +42,14 @@
       
       <!-- Controls -->
       <div class="controls">
+        <div class="key-row">
+          <input
+            v-model="voiceApiKey"
+            type="password"
+            placeholder="输入 Voice API Key (ocv_...)"
+          />
+          <button @click="saveVoiceApiKey">保存Key</button>
+        </div>
         <button @click="clearHistory">清除记录</button>
       </div>
     </div>
@@ -78,6 +86,7 @@ export default {
       asrApiKey: '',
       asrLanguage: 'zh',
       ttsVoice: 'Cherry',
+      voiceApiKey: '',
       recordedAudioChunks: [],
 
       // Turn/telemetry
@@ -120,6 +129,12 @@ export default {
       this.asrApiKey = queryKey || envKey || savedKey
       if (queryKey) localStorage.setItem('dashscope_api_key', queryKey)
 
+      const envVoiceKey = (import.meta && import.meta.env && import.meta.env.VITE_OPENCLAW_VOICE_API_KEY) || ''
+      const queryVoiceKey = qs.get('voice_api_key') || ''
+      const savedVoiceKey = localStorage.getItem('voice_api_key') || ''
+      this.voiceApiKey = queryVoiceKey || envVoiceKey || savedVoiceKey
+      if (queryVoiceKey) localStorage.setItem('voice_api_key', queryVoiceKey)
+
       if (this.useAppAsr && !this.asrApiKey) {
         console.warn('App ASR disabled: missing DASHSCOPE API key')
         this.useAppAsr = false
@@ -141,8 +156,14 @@ export default {
 
     connectWebSocket() {
       this.statusText = '连接中...'
-      
-      this.ws = new WebSocket(this.serverUrl)
+
+      let wsUrl = this.serverUrl
+      if (this.voiceApiKey) {
+        const sep = wsUrl.includes('?') ? '&' : '?'
+        wsUrl = `${wsUrl}${sep}api_key=${encodeURIComponent(this.voiceApiKey)}`
+      }
+
+      this.ws = new WebSocket(wsUrl)
       
       this.ws.onopen = () => {
         console.log('WS Connected')
@@ -160,9 +181,13 @@ export default {
         }
       }
 
-      this.ws.onclose = () => {
-        console.log('WS Disconnected')
+      this.ws.onclose = (ev) => {
+        console.log('WS Disconnected', ev.code, ev.reason)
         this.isConnected = false
+        if (ev.code === 4001 || ev.code === 4002) {
+          this.statusText = '鉴权失败，请检查 Voice API Key'
+          return
+        }
         this.statusText = '断开连接'
         setTimeout(() => this.connectWebSocket(), 3000)
       }
@@ -589,6 +614,21 @@ export default {
       return btoa(binary)
     },
 
+    saveVoiceApiKey() {
+      const key = (this.voiceApiKey || '').trim()
+      if (!key) {
+        localStorage.removeItem('voice_api_key')
+      } else {
+        localStorage.setItem('voice_api_key', key)
+      }
+
+      if (this.ws) {
+        this.ws.close()
+      } else {
+        this.connectWebSocket()
+      }
+    },
+
     clearHistory() {
       this.transcript = ''
       this.aiResponse = ''
@@ -771,8 +811,26 @@ h1 {
 
 .controls {
   display: flex;
+  flex-direction: column;
   gap: 10px;
   justify-content: center;
+  align-items: center;
+}
+
+.key-row {
+  display: flex;
+  width: 100%;
+  max-width: 460px;
+  gap: 8px;
+}
+
+.key-row input {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.06);
+  color: #fff;
 }
 
 .controls button {
