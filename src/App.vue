@@ -273,6 +273,7 @@ export default {
           }
         } catch (e) {
           console.error('App TTS failed:', e)
+          this.reportClientTtsStatus('app_tts_failed_fallback', { error: String(e && e.message ? e.message : e) })
           // 下轮自动回退到服务端 TTS，避免“有字无声”
           this.useAppTts = false
           this.useStreamingAppTts = false
@@ -562,6 +563,21 @@ export default {
       return btoa(binary)
     },
 
+    reportClientTtsStatus(status, extra = {}) {
+      if (!(this.ws && this.ws.readyState === WebSocket.OPEN)) return
+      try {
+        this.ws.send(JSON.stringify({
+          type: 'client_tts_status',
+          turn_id: this.currentTurnId,
+          status,
+          ts_ms: Date.now(),
+          ...extra,
+        }))
+      } catch (_) {
+        // ignore telemetry failures
+      }
+    },
+
     pushStreamingTtsChunk(text) {
       if (!text) return
       this.ttsPendingText += text
@@ -598,17 +614,24 @@ export default {
     async processTtsQueue() {
       if (this.ttsPlaying) return
       this.ttsPlaying = true
+      this.reportClientTtsStatus('queue_start', { queue_len: this.ttsQueue.length })
       try {
         while (this.ttsQueue.length > 0) {
           const seg = this.ttsQueue.shift()
           if (!seg) continue
+          this.reportClientTtsStatus('segment_start', { text_len: seg.length, queue_left: this.ttsQueue.length })
           const audioUrl = await this.synthesizeWithQwenTts(seg)
           if (audioUrl) {
             await this.playRemoteAudio(audioUrl)
+            this.reportClientTtsStatus('segment_done', { text_len: seg.length })
+          } else {
+            this.reportClientTtsStatus('segment_empty_audio_url', { text_len: seg.length })
           }
         }
+        this.reportClientTtsStatus('queue_done')
       } catch (e) {
         console.error('Streaming App TTS failed:', e)
+        this.reportClientTtsStatus('queue_error', { error: String(e && e.message ? e.message : e) })
         this.useAppTts = false
         this.useStreamingAppTts = false
         this.statusText = 'App TTS失败，下一轮回退服务端语音'
@@ -644,8 +667,13 @@ export default {
     },
 
     async synthesizeWithQwenTts(text) {
-      if (!this.asrApiKey) throw new Error('Missing DASHSCOPE API key for App TTS')
+      if (!this.asrApiKey) {
+        this.reportClientTtsStatus('missing_dashscope_key')
+        throw new Error('Missing DASHSCOPE API key for App TTS')
+      }
       if (!text || !text.trim()) return ''
+
+      this.reportClientTtsStatus('dashscope_request_start', { text_len: Math.min(text.length, 500) })
 
       const resp = await fetch('https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', {
         method: 'POST',
@@ -665,26 +693,42 @@ export default {
 
       if (!resp.ok) {
         const txt = await resp.text()
+        this.reportClientTtsStatus('dashscope_http_error', { http_status: resp.status, detail: (txt || '').slice(0, 180) })
         throw new Error(`Qwen TTS HTTP ${resp.status}: ${txt}`)
       }
 
       const json = await resp.json()
       const rawUrl = json?.output?.audio?.url || ''
-      if (!rawUrl) return ''
+      if (!rawUrl) {
+        this.reportClientTtsStatus('dashscope_empty_audio_url')
+        return ''
+      }
+      this.reportClientTtsStatus('dashscope_ok')
       return rawUrl.startsWith('http://') ? rawUrl.replace('http://', 'https://') : rawUrl
     },
 
     async playRemoteAudio(url) {
       return new Promise((resolve) => {
         try {
+          this.reportClientTtsStatus('play_start')
           const audio = new Audio(url)
-          audio.onended = () => resolve()
-          audio.onerror = () => resolve()
+          audio.onended = () => {
+            this.reportClientTtsStatus('play_end')
+            resolve()
+          }
+          audio.onerror = () => {
+            this.reportClientTtsStatus('play_error')
+            resolve()
+          }
           const p = audio.play()
           if (p && typeof p.catch === 'function') {
-            p.catch(() => resolve())
+            p.catch((e) => {
+              this.reportClientTtsStatus('play_promise_error', { error: String(e && e.message ? e.message : e) })
+              resolve()
+            })
           }
-        } catch (_) {
+        } catch (e) {
+          this.reportClientTtsStatus('play_exception', { error: String(e && e.message ? e.message : e) })
           resolve()
         }
       })
