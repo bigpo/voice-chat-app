@@ -80,6 +80,7 @@ export default {
       useAppVad: true,
       useAppAsr: true,
       useAppTts: true,
+      useStreamingAppTts: true,
       sendClientVadEvents: true,
 
       // App ASR (Qwen)
@@ -88,6 +89,12 @@ export default {
       ttsVoice: 'Cherry',
       voiceApiKey: '',
       recordedAudioChunks: [],
+
+      // App TTS streaming state
+      ttsPendingText: '',
+      ttsQueue: [],
+      ttsPlaying: false,
+      ttsDrainWaiters: [],
 
       // Turn/telemetry
       currentTurnId: null,
@@ -121,6 +128,7 @@ export default {
       this.useAppVad = toBool(qs.get('use_app_vad'), this.useAppVad)
       this.useAppAsr = toBool(qs.get('use_app_asr'), this.useAppAsr)
       this.useAppTts = toBool(qs.get('use_app_tts'), this.useAppTts)
+      this.useStreamingAppTts = toBool(qs.get('use_app_tts_stream'), this.useStreamingAppTts)
       this.sendClientVadEvents = toBool(qs.get('send_client_vad_events'), this.sendClientVadEvents)
 
       const envKey = (import.meta && import.meta.env && import.meta.env.VITE_DASHSCOPE_API_KEY) || ''
@@ -221,7 +229,12 @@ export default {
           
         case 'response_chunk':
           this.aiResponse = (this.aiResponse || '') + text
-          this.statusText = this.useAppTts ? '生成语音中...' : '说话中...'
+          if (this.useAppTts && this.useStreamingAppTts) {
+            this.pushStreamingTtsChunk(text || '')
+            this.statusText = '边生成边播报...'
+          } else {
+            this.statusText = this.useAppTts ? '生成语音中...' : '说话中...'
+          }
           break
           
         case 'audio_chunk':
@@ -239,12 +252,17 @@ export default {
     async handleResponseComplete(data) {
       const spokenText = (data?.spoken_text || data?.text || '').trim()
 
-      if (this.useAppTts && spokenText) {
+      if (this.useAppTts) {
         this.statusText = '说话中...'
         try {
-          const audioUrl = await this.synthesizeWithQwenTts(spokenText)
-          if (audioUrl) {
-            await this.playRemoteAudio(audioUrl)
+          if (this.useStreamingAppTts) {
+            this.flushStreamingTtsRemainder()
+            await this.waitForTtsQueueIdle(45000)
+          } else if (spokenText) {
+            const audioUrl = await this.synthesizeWithQwenTts(spokenText)
+            if (audioUrl) {
+              await this.playRemoteAudio(audioUrl)
+            }
           }
         } catch (e) {
           console.error('App TTS failed:', e)
@@ -355,6 +373,8 @@ export default {
         this.isListening = true
         this.transcript = ''
         this.aiResponse = ''
+        this.ttsPendingText = ''
+        this.ttsQueue = []
         
         this.ws.send(JSON.stringify({
           type: 'start_listening',
@@ -529,6 +549,84 @@ export default {
         binary += String.fromCharCode(...slice)
       }
       return btoa(binary)
+    },
+
+    pushStreamingTtsChunk(text) {
+      if (!text) return
+      this.ttsPendingText += text
+
+      // 按句切分，尽快播报（准流式）
+      const parts = this.ttsPendingText.split(/([。！？!?；;\n])/)
+      if (parts.length < 3) return
+
+      let consumeUntil = 0
+      for (let i = 0; i < parts.length - 1; i += 2) {
+        const sentence = `${parts[i] || ''}${parts[i + 1] || ''}`.trim()
+        if (sentence.length >= 2) {
+          this.ttsQueue.push(sentence.slice(0, 180))
+        }
+        consumeUntil += (parts[i] || '').length + (parts[i + 1] || '').length
+      }
+
+      if (consumeUntil > 0) {
+        this.ttsPendingText = this.ttsPendingText.slice(consumeUntil)
+      }
+
+      this.processTtsQueue()
+    },
+
+    flushStreamingTtsRemainder() {
+      const tail = (this.ttsPendingText || '').trim()
+      if (tail) {
+        this.ttsQueue.push(tail.slice(0, 180))
+      }
+      this.ttsPendingText = ''
+      this.processTtsQueue()
+    },
+
+    async processTtsQueue() {
+      if (this.ttsPlaying) return
+      this.ttsPlaying = true
+      try {
+        while (this.ttsQueue.length > 0) {
+          const seg = this.ttsQueue.shift()
+          if (!seg) continue
+          const audioUrl = await this.synthesizeWithQwenTts(seg)
+          if (audioUrl) {
+            await this.playRemoteAudio(audioUrl)
+          }
+        }
+      } catch (e) {
+        console.error('Streaming App TTS failed:', e)
+      } finally {
+        this.ttsPlaying = false
+        this.resolveTtsWaitersIfIdle()
+      }
+    },
+
+    resolveTtsWaitersIfIdle() {
+      if (this.ttsPlaying || this.ttsQueue.length > 0) return
+      const waiters = this.ttsDrainWaiters.splice(0, this.ttsDrainWaiters.length)
+      waiters.forEach((fn) => fn())
+    },
+
+    waitForTtsQueueIdle(timeoutMs = 30000) {
+      if (!this.ttsPlaying && this.ttsQueue.length === 0) return Promise.resolve()
+      return new Promise((resolve) => {
+        let timer = null
+        const done = () => {
+          if (timer) clearTimeout(timer)
+          resolve()
+        }
+
+        timer = setTimeout(() => {
+          const idx = this.ttsDrainWaiters.indexOf(done)
+          if (idx >= 0) this.ttsDrainWaiters.splice(idx, 1)
+          resolve()
+        }, timeoutMs)
+
+        this.ttsDrainWaiters.push(done)
+      })
     },
 
     async synthesizeWithQwenTts(text) {
