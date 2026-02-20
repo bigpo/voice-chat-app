@@ -805,6 +805,12 @@ export default {
       // Reload config to apply the new key
       this.loadRuntimeConfig()
       console.log("saveDashscopeKey: after loadRuntimeConfig, useAppAsr =", this.useAppAsr, "useAppTts =", this.useAppTts)
+      // Reconnect WS to apply new client_features
+      if (this.ws) {
+        console.log("saveDashscopeKey: reconnecting WS to apply new features")
+        this.ws.close()
+      }
+      this.connectWebSocket()
       alert('DashScope Key 已保存，App TTS/ASR 已启用')
     },
 
