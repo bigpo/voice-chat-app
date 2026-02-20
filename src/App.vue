@@ -68,9 +68,15 @@ export default {
       audioProcessor: null,
       audioSource: null,
       
-      // Phase1 flags
+      // Phase flags
       useAppVad: true,
+      useAppAsr: true,
       sendClientVadEvents: true,
+
+      // App ASR (Qwen)
+      asrApiKey: '',
+      asrLanguage: 'zh',
+      recordedAudioChunks: [],
 
       // Turn/telemetry
       currentTurnId: null,
@@ -87,12 +93,36 @@ export default {
     }
   },
   mounted() {
+    this.loadRuntimeConfig()
     this.connectWebSocket()
   },
   beforeUnmount() {
     this.disconnect()
   },
   methods: {
+    loadRuntimeConfig() {
+      const qs = new URLSearchParams(window.location.search)
+      const toBool = (v, d) => {
+        if (v === null || v === undefined || v === '') return d
+        return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase())
+      }
+
+      this.useAppVad = toBool(qs.get('use_app_vad'), this.useAppVad)
+      this.useAppAsr = toBool(qs.get('use_app_asr'), this.useAppAsr)
+      this.sendClientVadEvents = toBool(qs.get('send_client_vad_events'), this.sendClientVadEvents)
+
+      const envKey = (import.meta && import.meta.env && import.meta.env.VITE_DASHSCOPE_API_KEY) || ''
+      const queryKey = qs.get('dashscope_api_key') || ''
+      const savedKey = localStorage.getItem('dashscope_api_key') || ''
+      this.asrApiKey = queryKey || envKey || savedKey
+      if (queryKey) localStorage.setItem('dashscope_api_key', queryKey)
+
+      if (this.useAppAsr && !this.asrApiKey) {
+        console.warn('App ASR disabled: missing DASHSCOPE API key')
+        this.useAppAsr = false
+      }
+    },
+
     genTurnId() {
       if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID()
       return `turn_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
@@ -197,6 +227,7 @@ export default {
         this.recordStartAt = Date.now()
         this.lastSpeechAt = this.recordStartAt
         this.hasSpeechInTurn = false
+        this.recordedAudioChunks = []
         
         // Setup audio processing
         this.audioContext = new AudioContext({ sampleRate: 16000 })
@@ -206,6 +237,7 @@ export default {
         this.audioProcessor.onaudioprocess = (e) => {
           if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             const audioData = e.inputBuffer.getChannelData(0)
+            this.recordedAudioChunks.push(new Float32Array(audioData))
             const base64 = this.float32ToBase64(audioData)
             this.ws.send(JSON.stringify({
               type: 'audio',
@@ -279,7 +311,7 @@ export default {
         this.ws.send(JSON.stringify({
           type: 'start_listening',
           turn_id: this.currentTurnId,
-          client_features: { use_app_vad: this.useAppVad, use_app_asr: false, use_app_tts: false },
+          client_features: { use_app_vad: this.useAppVad, use_app_asr: this.useAppAsr, use_app_tts: false },
         }))
         
       } catch (e) {
@@ -288,7 +320,7 @@ export default {
       }
     },
 
-    stopRecording() {
+    async stopRecording() {
       if (!this.isListening) return
       
       this.isListening = false
@@ -307,19 +339,148 @@ export default {
         this.audioContext.close()
         this.audioContext = null
       }
-      
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.isProcessing = true
-        this.ws.send(JSON.stringify({
-          type: 'stop_listening',
-          turn_id: this.currentTurnId,
-          client_metrics: {
-            app_vad: this.useAppVad,
-            had_speech: this.hasSpeechInTurn,
-            record_ms: Date.now() - this.recordStartAt,
-          },
-        }))
+
+      if (!(this.ws && this.ws.readyState === WebSocket.OPEN)) return
+
+      this.isProcessing = true
+      this.ws.send(JSON.stringify({
+        type: 'stop_listening',
+        turn_id: this.currentTurnId,
+        skip_server_asr: this.useAppAsr,
+        client_metrics: {
+          app_vad: this.useAppVad,
+          app_asr: this.useAppAsr,
+          had_speech: this.hasSpeechInTurn,
+          record_ms: Date.now() - this.recordStartAt,
+        },
+      }))
+
+      if (this.useAppAsr) {
+        this.statusText = 'ASR识别中...'
+        const asrStartedAt = Date.now()
+        let text = ''
+        try {
+          text = await this.transcribeWithQwen(this.recordedAudioChunks, 16000)
+        } catch (e) {
+          console.error('App ASR failed:', e)
+          text = ''
+        }
+
+        const asrLatency = Date.now() - asrStartedAt
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'transcript_final',
+            turn_id: this.currentTurnId,
+            text,
+            source: 'app_qwen_asr',
+            latency_ms: { asr_client: asrLatency },
+          }))
+        }
       }
+    },
+
+    async transcribeWithQwen(chunks, sampleRate = 16000) {
+      if (!this.asrApiKey) throw new Error('Missing DASHSCOPE API key for App ASR')
+      if (!chunks || chunks.length === 0) return ''
+
+      const pcm = this.mergeFloat32Chunks(chunks)
+      const wavBytes = this.float32ToWavBytes(pcm, sampleRate)
+      const b64 = this.uint8ToBase64(wavBytes)
+      const dataUrl = `data:audio/wav;base64,${b64}`
+
+      const resp = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.asrApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'qwen3-asr-flash',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'input_audio',
+                  input_audio: { data: dataUrl },
+                },
+              ],
+            },
+          ],
+          extra_body: {
+            asr_options: {
+              language: this.asrLanguage,
+            },
+          },
+          stream: false,
+        }),
+      })
+
+      if (!resp.ok) {
+        const txt = await resp.text()
+        throw new Error(`Qwen ASR HTTP ${resp.status}: ${txt}`)
+      }
+
+      const json = await resp.json()
+      return (json?.choices?.[0]?.message?.content || '').trim()
+    },
+
+    mergeFloat32Chunks(chunks) {
+      const total = chunks.reduce((n, c) => n + c.length, 0)
+      const out = new Float32Array(total)
+      let offset = 0
+      for (const c of chunks) {
+        out.set(c, offset)
+        offset += c.length
+      }
+      return out
+    },
+
+    float32ToWavBytes(float32Array, sampleRate = 16000) {
+      const pcm16 = new Int16Array(float32Array.length)
+      for (let i = 0; i < float32Array.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32Array[i]))
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+      }
+
+      const dataSize = pcm16.length * 2
+      const buffer = new ArrayBuffer(44 + dataSize)
+      const view = new DataView(buffer)
+
+      const writeString = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+      }
+
+      writeString(0, 'RIFF')
+      view.setUint32(4, 36 + dataSize, true)
+      writeString(8, 'WAVE')
+      writeString(12, 'fmt ')
+      view.setUint32(16, 16, true)
+      view.setUint16(20, 1, true)
+      view.setUint16(22, 1, true)
+      view.setUint32(24, sampleRate, true)
+      view.setUint32(28, sampleRate * 2, true)
+      view.setUint16(32, 2, true)
+      view.setUint16(34, 16, true)
+      writeString(36, 'data')
+      view.setUint32(40, dataSize, true)
+
+      let offset = 44
+      for (let i = 0; i < pcm16.length; i++, offset += 2) {
+        view.setInt16(offset, pcm16[i], true)
+      }
+
+      return new Uint8Array(buffer)
+    },
+
+    uint8ToBase64(uint8) {
+      let binary = ''
+      const chunk = 0x8000
+      for (let i = 0; i < uint8.length; i += chunk) {
+        const slice = uint8.subarray(i, i + chunk)
+        binary += String.fromCharCode(...slice)
+      }
+      return btoa(binary)
     },
 
     playAudioChunk(base64Data, sampleRate = 16000) {
