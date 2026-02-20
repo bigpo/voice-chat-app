@@ -7,12 +7,13 @@
       <button 
         class="voice-button" 
         :class="{ listening: isListening }"
-        @mousedown="startRecording"
-        @mouseup="stopRecording"
-        @touchstart.prevent="startRecording"
-        @touchend.prevent="stopRecording"
+        @mousedown="!continuousMode && startRecording()"
+        @mouseup="!continuousMode && stopRecording()"
+        @touchstart.prevent="!continuousMode && startRecording()"
+        @touchend.prevent="!continuousMode && stopRecording()"
+        @click="continuousMode && onVoiceButtonClick()"
       >
-        {{ isListening ? '正在听...' : (continuousMode ? '点击说话' : '按住说话') }}
+        {{ isListening ? '正在听...' : (continuousMode ? '点击开始' : '按住说话') }}
       </button>
       
       <!-- Continuous Mode Toggle -->
@@ -67,6 +68,20 @@ export default {
       audioProcessor: null,
       audioSource: null,
       
+      // Phase1 flags
+      useAppVad: true,
+      sendClientVadEvents: true,
+
+      // Turn/telemetry
+      currentTurnId: null,
+      audioSeq: 0,
+      recordStartAt: 0,
+      lastSpeechAt: 0,
+      hasSpeechInTurn: false,
+      dynamicNoiseFloor: 0.003,
+      silenceThresholdMs: 1000,
+      maxRecordMs: 12000,
+
       // Config
       serverUrl: 'ws://154.89.149.198:8765/ws'
     }
@@ -78,6 +93,19 @@ export default {
     this.disconnect()
   },
   methods: {
+    genTurnId() {
+      if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID()
+      return `turn_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
+    },
+
+    onVoiceButtonClick() {
+      if (this.isListening) {
+        this.stopRecording()
+      } else {
+        this.startRecording()
+      }
+    },
+
     connectWebSocket() {
       this.statusText = '连接中...'
       
@@ -86,7 +114,7 @@ export default {
       this.ws.onopen = () => {
         console.log('WS Connected')
         this.isConnected = true
-        this.statusText = '就绪'
+        this.statusText = this.useAppVad ? '就绪（App VAD）' : '就绪（Server VAD）'
       }
 
       this.ws.onmessage = (event) => {
@@ -139,11 +167,12 @@ export default {
           break
           
         case 'audio_chunk':
-          this.playAudioChunk(data.data)
+          this.playAudioChunk(data.data, data.sample_rate || 16000)
           break
           
         case 'response_complete':
           this.isProcessing = false
+          this.currentTurnId = null
           this.statusText = this.continuousMode ? '🎙️ 就绪' : '就绪'
           if (this.continuousMode) {
             setTimeout(() => this.startRecording(), 500)
@@ -162,6 +191,12 @@ export default {
             audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
           })
         }
+
+        this.currentTurnId = this.genTurnId()
+        this.audioSeq = 0
+        this.recordStartAt = Date.now()
+        this.lastSpeechAt = this.recordStartAt
+        this.hasSpeechInTurn = false
         
         // Setup audio processing
         this.audioContext = new AudioContext({ sampleRate: 16000 })
@@ -172,7 +207,65 @@ export default {
           if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             const audioData = e.inputBuffer.getChannelData(0)
             const base64 = this.float32ToBase64(audioData)
-            this.ws.send(JSON.stringify({ type: 'audio', data: base64 }))
+            this.ws.send(JSON.stringify({
+              type: 'audio',
+              data: base64,
+              turn_id: this.currentTurnId,
+              seq: this.audioSeq++,
+              client_ts_ms: Date.now(),
+            }))
+
+            if (this.continuousMode && this.useAppVad) {
+              const now = Date.now()
+              let sqSum = 0
+              for (let i = 0; i < audioData.length; i++) {
+                const v = audioData[i]
+                sqSum += v * v
+              }
+              const rms = Math.sqrt(sqSum / audioData.length)
+
+              if (rms < this.dynamicNoiseFloor * 1.8) {
+                this.dynamicNoiseFloor = this.dynamicNoiseFloor * 0.98 + rms * 0.02
+              }
+
+              const speechStartThreshold = Math.max(this.dynamicNoiseFloor * 3.0, 0.012)
+              const speechEndThreshold = Math.max(this.dynamicNoiseFloor * 1.8, 0.006)
+
+              if (rms > speechStartThreshold) {
+                if (!this.hasSpeechInTurn && this.sendClientVadEvents) {
+                  this.ws.send(JSON.stringify({
+                    type: 'client_vad',
+                    turn_id: this.currentTurnId,
+                    event: 'speech_started',
+                    rms,
+                    threshold: speechStartThreshold,
+                    ts_ms: now,
+                  }))
+                }
+                this.hasSpeechInTurn = true
+                this.lastSpeechAt = now
+              }
+
+              if (this.hasSpeechInTurn && rms < speechEndThreshold && (now - this.lastSpeechAt) > this.silenceThresholdMs) {
+                if (this.sendClientVadEvents) {
+                  this.ws.send(JSON.stringify({
+                    type: 'client_vad',
+                    turn_id: this.currentTurnId,
+                    event: 'speech_stopped',
+                    rms,
+                    threshold: speechEndThreshold,
+                    ts_ms: now,
+                  }))
+                }
+                this.stopRecording()
+                return
+              }
+
+              if ((now - this.recordStartAt) > this.maxRecordMs) {
+                this.stopRecording()
+                return
+              }
+            }
           }
         }
         
@@ -183,7 +276,11 @@ export default {
         this.transcript = ''
         this.aiResponse = ''
         
-        this.ws.send(JSON.stringify({ type: 'start_listening' }))
+        this.ws.send(JSON.stringify({
+          type: 'start_listening',
+          turn_id: this.currentTurnId,
+          client_features: { use_app_vad: this.useAppVad, use_app_asr: false, use_app_tts: false },
+        }))
         
       } catch (e) {
         console.error('Recording error:', e)
@@ -212,11 +309,20 @@ export default {
       }
       
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'stop_listening' }))
+        this.isProcessing = true
+        this.ws.send(JSON.stringify({
+          type: 'stop_listening',
+          turn_id: this.currentTurnId,
+          client_metrics: {
+            app_vad: this.useAppVad,
+            had_speech: this.hasSpeechInTurn,
+            record_ms: Date.now() - this.recordStartAt,
+          },
+        }))
       }
     },
 
-    playAudioChunk(base64Data) {
+    playAudioChunk(base64Data, sampleRate = 16000) {
       try {
         const binary = atob(base64Data)
         const bytes = new Uint8Array(binary.length)
@@ -230,8 +336,8 @@ export default {
           float32Array[i] = int16Array[i] / 32768.0
         }
         
-        const audioCtx = new AudioContext()
-        const buffer = audioCtx.createBuffer(1, float32Array.length, 16000)
+        const audioCtx = new AudioContext({ sampleRate })
+        const buffer = audioCtx.createBuffer(1, float32Array.length, sampleRate)
         buffer.getChannelData(0).set(float32Array)
         
         const source = audioCtx.createBufferSource()
