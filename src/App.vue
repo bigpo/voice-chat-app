@@ -396,6 +396,7 @@ export default {
         this.ttsPendingText = ''
         this.ttsQueue = []
         
+        console.log("start_listening: use_app_asr =", this.useAppAsr, "use_app_tts =", this.useAppTts, "asrApiKey =", this.asrApiKey ? "set" : "empty")
         this.ws.send(JSON.stringify({
           type: 'start_listening',
           turn_id: this.currentTurnId,
@@ -795,6 +796,7 @@ export default {
 
     saveDashscopeKey() {
       const key = (this.asrApiKey || '').trim()
+      console.log("saveDashscopeKey: input key =", key ? "SET" : "EMPTY")
       if (!key) {
         localStorage.removeItem('dashscope_api_key')
       } else {
@@ -802,6 +804,7 @@ export default {
       }
       // Reload config to apply the new key
       this.loadRuntimeConfig()
+      console.log("saveDashscopeKey: after loadRuntimeConfig, useAppAsr =", this.useAppAsr, "useAppTts =", this.useAppTts)
       alert('DashScope Key 已保存，App TTS/ASR 已启用')
     },
 
