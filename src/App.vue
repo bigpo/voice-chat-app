@@ -46,9 +46,17 @@
           <input
             v-model="voiceApiKey"
             type="password"
-            placeholder="输入 Voice API Key (ocv_...)"
+            placeholder="Voice API Key (ocv_...)"
           />
-          <button @click="saveVoiceApiKey">保存Key</button>
+          <button @click="saveVoiceApiKey">保存</button>
+        </div>
+        <div class="key-row">
+          <input
+            v-model="asrApiKey"
+            type="password"
+            placeholder="DashScope API Key (sk-...)"
+          />
+          <button @click="saveDashscopeKey">保存</button>
         </div>
         <button @click="clearHistory">清除记录</button>
       </div>
@@ -783,6 +791,18 @@ export default {
       } else {
         this.connectWebSocket()
       }
+    },
+
+    saveDashscopeKey() {
+      const key = (this.asrApiKey || '').trim()
+      if (!key) {
+        localStorage.removeItem('dashscope_api_key')
+      } else {
+        localStorage.setItem('dashscope_api_key', key)
+      }
+      // Reload config to apply the new key
+      this.loadRuntimeConfig()
+      alert('DashScope Key 已保存，App TTS/ASR 已启用')
     },
 
     clearHistory() {
