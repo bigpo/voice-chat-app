@@ -71,11 +71,13 @@ export default {
       // Phase flags
       useAppVad: true,
       useAppAsr: true,
+      useAppTts: true,
       sendClientVadEvents: true,
 
       // App ASR (Qwen)
       asrApiKey: '',
       asrLanguage: 'zh',
+      ttsVoice: 'Cherry',
       recordedAudioChunks: [],
 
       // Turn/telemetry
@@ -109,6 +111,7 @@ export default {
 
       this.useAppVad = toBool(qs.get('use_app_vad'), this.useAppVad)
       this.useAppAsr = toBool(qs.get('use_app_asr'), this.useAppAsr)
+      this.useAppTts = toBool(qs.get('use_app_tts'), this.useAppTts)
       this.sendClientVadEvents = toBool(qs.get('send_client_vad_events'), this.sendClientVadEvents)
 
       const envKey = (import.meta && import.meta.env && import.meta.env.VITE_DASHSCOPE_API_KEY) || ''
@@ -193,21 +196,41 @@ export default {
           
         case 'response_chunk':
           this.aiResponse = (this.aiResponse || '') + text
-          this.statusText = '说话中...'
+          this.statusText = this.useAppTts ? '生成语音中...' : '说话中...'
           break
           
         case 'audio_chunk':
-          this.playAudioChunk(data.data, data.sample_rate || 16000)
+          if (!this.useAppTts) {
+            this.playAudioChunk(data.data, data.sample_rate || 16000)
+          }
           break
           
         case 'response_complete':
-          this.isProcessing = false
-          this.currentTurnId = null
-          this.statusText = this.continuousMode ? '🎙️ 就绪' : '就绪'
-          if (this.continuousMode) {
-            setTimeout(() => this.startRecording(), 500)
-          }
+          this.handleResponseComplete(data)
           break
+      }
+    },
+
+    async handleResponseComplete(data) {
+      const spokenText = (data?.spoken_text || data?.text || '').trim()
+
+      if (this.useAppTts && spokenText) {
+        this.statusText = '说话中...'
+        try {
+          const audioUrl = await this.synthesizeWithQwenTts(spokenText)
+          if (audioUrl) {
+            await this.playRemoteAudio(audioUrl)
+          }
+        } catch (e) {
+          console.error('App TTS failed:', e)
+        }
+      }
+
+      this.isProcessing = false
+      this.currentTurnId = null
+      this.statusText = this.continuousMode ? '🎙️ 就绪' : '就绪'
+      if (this.continuousMode) {
+        setTimeout(() => this.startRecording(), 500)
       }
     },
 
@@ -311,7 +334,7 @@ export default {
         this.ws.send(JSON.stringify({
           type: 'start_listening',
           turn_id: this.currentTurnId,
-          client_features: { use_app_vad: this.useAppVad, use_app_asr: this.useAppAsr, use_app_tts: false },
+          client_features: { use_app_vad: this.useAppVad, use_app_asr: this.useAppAsr, use_app_tts: this.useAppTts },
         }))
         
       } catch (e) {
@@ -481,6 +504,53 @@ export default {
         binary += String.fromCharCode(...slice)
       }
       return btoa(binary)
+    },
+
+    async synthesizeWithQwenTts(text) {
+      if (!this.asrApiKey) throw new Error('Missing DASHSCOPE API key for App TTS')
+      if (!text || !text.trim()) return ''
+
+      const resp = await fetch('https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.asrApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'qwen3-tts-flash',
+          input: {
+            text: text.slice(0, 500),
+            voice: this.ttsVoice,
+            language_type: 'Chinese',
+          },
+        }),
+      })
+
+      if (!resp.ok) {
+        const txt = await resp.text()
+        throw new Error(`Qwen TTS HTTP ${resp.status}: ${txt}`)
+      }
+
+      const json = await resp.json()
+      const rawUrl = json?.output?.audio?.url || ''
+      if (!rawUrl) return ''
+      return rawUrl.startsWith('http://') ? rawUrl.replace('http://', 'https://') : rawUrl
+    },
+
+    async playRemoteAudio(url) {
+      return new Promise((resolve) => {
+        try {
+          const audio = new Audio(url)
+          audio.onended = () => resolve()
+          audio.onerror = () => resolve()
+          const p = audio.play()
+          if (p && typeof p.catch === 'function') {
+            p.catch(() => resolve())
+          }
+        } catch (_) {
+          resolve()
+        }
+      })
     },
 
     playAudioChunk(base64Data, sampleRate = 16000) {
